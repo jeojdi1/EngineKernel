@@ -146,7 +146,9 @@ class Qwen3(torch.nn.Module):
     # ------------------------------------------------------------------
     def _proj(self, x, layer, key):
         """A decode-shaped projection, via whichever path won on this device."""
-        if self.use_gemv:
+        # gemv pads its row dimension to a power of two >= 16; keep it below 64,
+        # where Triton 3.1.0 aborts the compiler on Hopper
+        if self.use_gemv and x.shape[0] <= 32:
             return gemv(x, layer[key])
         return torch.matmul(x, layer[key + "_t"])
 
@@ -338,6 +340,6 @@ class Qwen3(torch.nn.Module):
 
     def argmax_token(self, hidden):
         # hidden is [B, H] in both prefill and decode, so always the small path
-        logits = (gemv(hidden, self.lm_head) if self.use_gemv
+        logits = (gemv(hidden, self.lm_head) if self.use_gemv and hidden.shape[0] <= 32
                   else torch.matmul(hidden, self.lm_head_t))
         return torch.argmax(logits, dim=-1)

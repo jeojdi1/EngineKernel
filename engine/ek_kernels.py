@@ -43,6 +43,11 @@ def has_triton() -> bool:
     return _HAS_TRITON
 
 
+def disable_triton() -> None:
+    global _HAS_TRITON
+    _HAS_TRITON = False
+
+
 def probe_triton() -> bool:
     """Actually compile and run one kernel. Importing Triton proves nothing: it
     builds its launcher with a C compiler at first use, and a slim sandbox may
