@@ -33,14 +33,21 @@ TARGET_S_MAX = int(os.environ.get("ENGINE_S_MAX", "8192"))
 # proposes tokens, one forward pass scores them all, and only tokens equal to
 # the model's own argmax are emitted -- so any draft, good or bad, is safe.
 SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"
-SPEC_Q_SMALL = int(os.environ.get("ENGINE_SPEC_Q_SMALL", "8"))
-SPEC_Q_LARGE = int(os.environ.get("ENGINE_SPEC_Q_LARGE", "4"))
-SPEC_Q_SPLIT = int(os.environ.get("ENGINE_SPEC_Q_SPLIT", "8"))
+SPEC_Q = int(os.environ.get("ENGINE_SPEC_Q", "0"))
 SPEC_Q_MAX = 16
 
 
 def _spec_q(b: int) -> int:
-    return SPEC_Q_SMALL if b <= SPEC_Q_SPLIT else SPEC_Q_LARGE
+    """Tokens scored per sequence per step (1 real + Q-1 drafts).
+
+    Measured on sm_90: a verify step costs ~2% more per extra draft token at
+    batch <= 16 and ~5% at batch 32, while accepted tokens scale with Q whenever
+    the output is predictable. So spend a fixed budget of ~128 scored tokens
+    per step and split it across the batch.
+    """
+    if SPEC_Q:
+        return SPEC_Q
+    return max(3, min(12, 128 // max(b, 1)))
 
 
 class _Graph:
@@ -79,6 +86,7 @@ class Engine:
         self.cache_s = 0
 
         self.host_buf = None
+        self.last_stats = (0, 0)
         self.events = None
         if self.cuda:
             b_max, s_max = self._budget()
@@ -220,7 +228,11 @@ class Engine:
         m3 = m2 & torch.cat([g.zc2, (g.hist == k_pp)[:, :-2]], dim=1)
         score = m1.long() * (g.arh + 1)[None, :] + m2.long() * big + m3.long() * (2 * big)
         p = score.max(dim=1).values % big
-        draft = g.hist.gather(1, (p[:, None] + g.ark[None, :]).clamp(max=hsz - 1))
+        # The continuation after the match is hist[p:hl]. If the output is in a
+        # loop of period P the latest match is only P back, so a longer draft
+        # would run past hl into stale entries; wrapping continues the cycle.
+        span = (hl - p).clamp(min=1)
+        draft = g.hist.gather(1, (p[:, None] + g.ark[None, :] % span[:, None]).clamp(max=hsz - 1))
         tokens = torch.cat([k_last, draft], dim=1)
 
         am = self.model.verify(tokens, g.pos_b, k, v, g.len_b, g.start_t, g.ws)
@@ -471,6 +483,7 @@ class Engine:
             while out_i < ready:
                 yield [queues[r][out_i] for r in range(b)]
                 out_i += 1
+        self.last_stats = (consumed, max_new_tokens - 1)
 
     # -- reference path (CPU / oversized requests) ----------------------
     def _generate_eager(self, ids, pos, pad, s, bias, max_new_tokens):
