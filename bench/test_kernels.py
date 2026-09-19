@@ -57,14 +57,20 @@ def t_silu_mul():
 
 
 def t_qk_norm_rope():
-    print("qk_norm_rope (both paths vs fp32 gold)")
+    print("qk_norm_rope_kv (vs fp32 gold, incl. cache writes)")
     nq, nkv, d = 32, 8, 128
-    for m in (1, 16, 4096):
+    for b, mpb in ((1, 1), (4, 1), (2, 16)):
+        m = b * mpb
+        smax = 64
         qkv = torch.randn(m, (nq + 2 * nkv) * d, device=DEV, dtype=torch.bfloat16)
         qn = torch.randn(d, device=DEV, dtype=torch.bfloat16)
         kn = torch.randn(d, device=DEV, dtype=torch.bfloat16)
         cos = torch.randn(m, d, device=DEV, dtype=torch.bfloat16)
         sin = torch.randn(m, d, device=DEV, dtype=torch.bfloat16)
+        kc = torch.zeros(b, nkv, smax, d, device=DEV, dtype=torch.bfloat16)
+        vc = torch.zeros_like(kc)
+        base = 7 if mpb == 1 else 0
+        slot = torch.tensor([base], dtype=torch.int64, device=DEV)
 
         x = qkv.float()
         gold = x.clone()
@@ -77,14 +83,16 @@ def t_qk_norm_rope():
                                         + rot * sin.float().unsqueeze(1)).reshape(m, n * d)
 
         got = qkv.clone()
-        K.qk_norm_rope_(got, qn, kn, cos, sin, nq, nkv, 1e-6)
-        ref = qkv.clone().cpu()
-        K.qk_norm_rope_(ref, qn.cpu(), kn.cpu(), cos.cpu(), sin.cpu(), nq, nkv, 1e-6)
+        K.qk_norm_rope_kv(got, qn, kn, cos, sin, kc, vc, slot, nq, nkv, 1e-6, mpb)
+        tag = f"b={b} mpb={mpb}"
+        check(f"q in place {tag}", got[:, :nq * d], gold[:, :nq * d])
 
-        end = (nq + nkv) * d
-        check(f"qk_norm_rope triton m={m}", got[:, :end], gold[:, :end])
-        check(f"qk_norm_rope torchref m={m}", ref[:, :end].to(DEV), gold[:, :end])
-        check(f"qk_norm_rope v untouched m={m}", got[:, end:], qkv[:, end:])
+        kexp = gold[:, nq * d:(nq + nkv) * d].reshape(b, mpb, nkv, d).transpose(1, 2)
+        vexp = qkv[:, (nq + nkv) * d:].reshape(b, mpb, nkv, d).transpose(1, 2)
+        check(f"k -> cache {tag}", kc[:, :, base:base + mpb], kexp)
+        check(f"v -> cache {tag}", vc[:, :, base:base + mpb], vexp.float())
+        untouched = torch.cat([kc[:, :, :base], kc[:, :, base + mpb:]], dim=2)
+        check(f"cache elsewhere untouched {tag}", untouched, torch.zeros_like(untouched))
 
 
 def ref_attn(q, kc, vc, seq_len, start):

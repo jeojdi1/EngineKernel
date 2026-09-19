@@ -6,6 +6,8 @@ The fallbacks exist so the whole model can be exercised on CPU against
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:
@@ -168,14 +170,15 @@ if _HAS_TRITON:
     @triton.jit
     def _flash_decode_split_kernel(
         Q, K, V, SeqLen, Start,
-        Acc, Lsum, Mmax,
+        Acc, Lsum, Mmax, Out,
         sm_scale,
         stride_qb, stride_qh,
+        stride_ob, stride_oh,
         stride_kb, stride_kh, stride_ks,
         stride_ab, stride_ah, stride_as, stride_ag,
         stride_lb, stride_lh, stride_ls,
         N_KV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr,
-        BLOCK_N: tl.constexpr, CHUNK: tl.constexpr,
+        BLOCK_N: tl.constexpr, CHUNK: tl.constexpr, SPLITS_ONE: tl.constexpr,
     ):
         """One program per (batch, kv-head, sequence-split).
 
@@ -233,12 +236,19 @@ if _HAS_TRITON:
             l_i = l_i * alpha + tl.sum(p, 1)
             m_i = m_new
 
-        aptr = Acc + b * stride_ab + h * stride_ah + pid_s * stride_as
-        tl.store(aptr + offs_g[:, None] * stride_ag + offs_d[None, :], acc, mask=gmask[:, None])
-        lptr = Lsum + b * stride_lb + h * stride_lh + pid_s * stride_ls
-        mptr = Mmax + b * stride_lb + h * stride_lh + pid_s * stride_ls
-        tl.store(lptr + offs_g, l_i, mask=gmask)
-        tl.store(mptr + offs_g, m_i, mask=gmask)
+        if SPLITS_ONE:
+            # one split means no partials to merge: write the answer here and
+            # skip the combine launch. Two launches per layer is most of the
+            # cost of decode attention at small batch.
+            tl.store(Out + b * stride_ob + (h * G + offs_g)[:, None] * stride_oh + offs_d[None, :],
+                     (acc / l_i[:, None]).to(tl.bfloat16), mask=gmask[:, None])
+        else:
+            aptr = Acc + b * stride_ab + h * stride_ah + pid_s * stride_as
+            tl.store(aptr + offs_g[:, None] * stride_ag + offs_d[None, :], acc, mask=gmask[:, None])
+            lptr = Lsum + b * stride_lb + h * stride_lh + pid_s * stride_ls
+            mptr = Mmax + b * stride_lb + h * stride_lh + pid_s * stride_ls
+            tl.store(lptr + offs_g, l_i, mask=gmask)
+            tl.store(mptr + offs_g, m_i, mask=gmask)
 
     @triton.jit
     def _flash_decode_combine_kernel(
@@ -418,10 +428,21 @@ def group_pad(n_heads: int, n_kv: int) -> int:
     return max(16, _next_pow2(n_heads // n_kv))
 
 
-def plan_splits(batch: int, n_kv: int, bucket: int, block_n: int = 64, target_cta: int = 264):
-    """Pick a sequence-split count that keeps the H100's 132 SMs busy."""
+def plan_splits(batch: int, n_kv: int, bucket: int, block_n: int = 64, target_cta: int = 0):
+    """Pick a sequence-split count that keeps the SMs busy.
+
+    More splits means more parallelism but a second (combine) launch; at small
+    batch the launches dominate the tiny amount of KV actually read.
+    """
+    sms = _sm_count()
+    target_cta = target_cta or int(os.environ.get("ENGINE_ATTN_CTA", "0")) or 2 * sms
     base = batch * n_kv
-    splits = max(1, min(32, _cdiv(target_cta, base)))
+    if base >= sms:
+        # (batch x kv-heads) already fills the machine; splitting only buys a
+        # second launch. Measured: b=16 is ~1% faster at one split.
+        splits = 1
+    else:
+        splits = max(1, min(32, _cdiv(target_cta, base)))
     splits = max(1, min(splits, _cdiv(bucket, block_n)))
     chunk = _cdiv(_cdiv(bucket, splits), block_n) * block_n
     return splits, chunk, block_n
@@ -434,14 +455,17 @@ def flash_decode(q, k_cache, v_cache, seq_len_t, start_t, workspace, sm_scale):
     g = hq // hkv
     acc, lsum, mmax, out, splits, chunk, block_n = workspace
     _flash_decode_split_kernel[(b * hkv, splits)](
-        q, k_cache, v_cache, seq_len_t, start_t, acc, lsum, mmax, sm_scale,
+        q, k_cache, v_cache, seq_len_t, start_t, acc, lsum, mmax, out, sm_scale,
         q.stride(0), q.stride(1),
+        out.stride(0), out.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
         lsum.stride(0), lsum.stride(1), lsum.stride(2),
         N_KV=hkv, G=g, GP=group_pad(hq, hkv), D=d, BLOCK_N=block_n, CHUNK=chunk,
-        num_warps=4, num_stages=2,
+        SPLITS_ONE=(splits == 1), num_warps=4, num_stages=2,
     )
+    if splits == 1:
+        return out
     _flash_decode_combine_kernel[(b * hkv * g,)](
         acc, lsum, mmax, out,
         acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
