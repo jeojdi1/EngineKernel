@@ -48,7 +48,7 @@ def main():
     vc = [torch.randn_like(t) for t in kc]
     len_t = torch.tensor([a.seq], dtype=torch.int64, device=dev)
     st = torch.zeros(b, dtype=torch.int32, device=dev)
-    slot = torch.zeros(1, dtype=torch.int64, device=dev)
+    slot = torch.zeros(b, dtype=torch.int64, device=dev)
     cs = torch.randn(b, c.head_dim, device=dev, dtype=torch.bfloat16)
     ws = eng._make_ws(b, a.seq)
     qs, kvs = c.q_size, c.kv_size

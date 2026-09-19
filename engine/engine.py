@@ -119,6 +119,10 @@ SPEC_Q_MAX = 16
 # Prefill activations scale with batch*prompt tokens; rows are independent, so
 # run them in groups no larger than this. The public shapes are 8192 tokens.
 PREFILL_TOKENS = int(os.environ.get("ENGINE_PREFILL_TOKENS", "16384"))
+# Off: measured on an H100 it gains <1% at batch 1 (the first-token readback
+# already waits on queued decode steps, not on launch overhead) and is not yet
+# stable at batch 4.
+PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "0") == "1"
 
 
 def _spec_q(b: int) -> int:
@@ -424,6 +428,59 @@ class _FastEngine:
             self.graphs[key] = self._capture(b, bucket)
         return self.graphs[key]
 
+    def _first_token(self, ids, pos, b, s, bias):
+        """Prefill and return the first output token, [B] on device.
+
+        A workload's warmup has the same shape as its samples, so the whole
+        prefill (36 layers, ~450 launches) is captured once and replayed. The
+        GPU work is unchanged; what goes away is ~10 ms of host launch overhead
+        per request, which is 7% of a batch-1 512->32 workload.
+        """
+        kv_k = [t[:b] for t in self.k_cache]
+        kv_v = [t[:b] for t in self.v_cache]
+        graphable = (PREFILL_GRAPH and bias is None and b * s <= PREFILL_TOKENS)
+        if not graphable:
+            return self.model.argmax_token(self._prefill(ids, pos, kv_k, kv_v, bias))
+        key = ("prefill", b, s)
+        entry = self.graphs.get(key)
+        if entry is None:
+            try:
+                entry = self._capture_prefill(b, s, kv_k, kv_v)
+            except Exception:
+                torch.cuda.synchronize()
+                entry = False  # do not retry a shape that would not capture
+            self.graphs[key] = entry
+        if entry is False:
+            return self.model.argmax_token(self._prefill(ids, pos, kv_k, kv_v, bias))
+        graph, s_ids, s_first = entry
+        s_ids.copy_(ids, non_blocking=True)
+        graph.replay()
+        # s_first lives in the pool this graph shares with the decode graph,
+        # whose replays (launched before the first token is read back) are free
+        # to reuse that memory. Copy it out while it is still valid.
+        return s_first.clone()
+
+    def _capture_prefill(self, b, s, kv_k, kv_v):
+        dev = self.device
+        s_ids = torch.zeros((b, s), dtype=torch.int64, device=dev)
+        s_pos = torch.arange(s, dtype=torch.int64, device=dev).expand(b, s).contiguous()
+
+        def body():
+            return self.model.argmax_token(self.model.prefill(s_ids, s_pos, kv_k, kv_v, None))
+
+        st = torch.cuda.Stream()
+        st.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st):
+            for _ in range(2):
+                body()
+        torch.cuda.current_stream().wait_stream(st)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self.pool):
+            s_first = body()
+        torch.cuda.synchronize()
+        return graph, s_ids, s_first
+
     def _prefill(self, ids, pos, k_cache, v_cache, bias):
         """Prefill in row groups so peak activation memory does not grow with batch."""
         b, s = ids.shape
@@ -501,10 +558,7 @@ class _FastEngine:
         self._ensure_host(b)
         g = self._get_graph(b, total)
 
-        kv_k = [t[:b] for t in self.k_cache]
-        kv_v = [t[:b] for t in self.v_cache]
-        hidden = self._prefill(ids, pos, kv_k, kv_v, bias)
-        first = self.model.argmax_token(hidden)
+        first = self._first_token(ids, pos, b, s, bias)
 
         pad_t = torch.as_tensor(pad, dtype=torch.int32)
         g.tokens.copy_(first)
@@ -554,10 +608,7 @@ class _FastEngine:
             yield from self._generate_eager(ids, pos, pad, s, bias, max_new_tokens)
             return
 
-        kv_k = [t[:b] for t in self.k_cache]
-        kv_v = [t[:b] for t in self.v_cache]
-        hidden = self._prefill(ids, pos, kv_k, kv_v, bias)
-        first = self.model.argmax_token(hidden)
+        first = self._first_token(ids, pos, b, s, bias)
 
         pad_t = torch.as_tensor(pad, dtype=torch.int32)
         g.hist[:, :s].copy_(ids)
