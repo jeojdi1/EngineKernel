@@ -168,6 +168,26 @@ if _HAS_TRITON:
                  mask=mmask[:, None] & nmask[None, :])
 
     @triton.jit
+    def _gemv1_kernel(
+        X, W, Y, K,
+        stride_wn,
+        N: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        """y[0, :] = x[0, :] @ w.T for a single row. Pure FMA reduction."""
+        pid = tl.program_id(0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        nmask = offs_n < N
+        acc = tl.zeros([BLOCK_N], tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            kmask = offs_k < K
+            x = tl.load(X + offs_k, mask=kmask, other=0.0).to(tl.float32)
+            w = tl.load(W + offs_n[:, None] * stride_wn + offs_k[None, :],
+                        mask=nmask[:, None] & kmask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w * x[None, :], axis=1)
+        tl.store(Y + offs_n, acc.to(tl.bfloat16), mask=nmask)
+
+    @triton.jit
     def _flash_decode_split_kernel(
         Q, K, V, SeqLen, Start,
         Acc, Lsum, Mmax, Out,
@@ -409,6 +429,21 @@ def gemv_config(n: int, k: int, sms: int = 0):
     return bn, bk
 
 
+def gemv1(x, w, out=None):
+    """Single-row projection: x [1, K], w [N, K] -> [1, N]."""
+    k = x.shape[1]
+    n = w.shape[0]
+    y = torch.empty(1, n, device=x.device, dtype=x.dtype) if out is None else out
+    bn = int(os.environ.get("ENGINE_GEMV1_BN", "0")) or 64
+    bk = int(os.environ.get("ENGINE_GEMV1_BK", "0")) or 128
+    _gemv1_kernel[(_cdiv(n, bn),)](
+        x, w, y, k, w.stride(0), N=n, BLOCK_N=bn, BLOCK_K=bk,
+        num_warps=int(os.environ.get("ENGINE_GEMV1_W", "8")),
+        num_stages=int(os.environ.get("ENGINE_GEMV1_S", "3")),
+    )
+    return y
+
+
 def gemv(x, w, out=None, cfg=None):
     """x: [M, K]; w: [N, K] (untransposed) -> [M, N]."""
     m, k = x.shape
@@ -428,16 +463,17 @@ def group_pad(n_heads: int, n_kv: int) -> int:
     return max(16, _next_pow2(n_heads // n_kv))
 
 
-def plan_splits(batch: int, n_kv: int, bucket: int, block_n: int = 64, target_cta: int = 0):
+def plan_splits(batch: int, n_kv: int, bucket: int, block_n: int = 0, target_cta: int = 0):
     """Pick a sequence-split count that keeps the SMs busy.
 
     More splits means more parallelism but a second (combine) launch; at small
     batch the launches dominate the tiny amount of KV actually read.
     """
     sms = _sm_count()
+    block_n = block_n or int(os.environ.get("ENGINE_ATTN_BLOCK", "0")) or 128
     target_cta = target_cta or int(os.environ.get("ENGINE_ATTN_CTA", "0")) or 2 * sms
     base = batch * n_kv
-    if base >= sms:
+    if base >= sms * float(os.environ.get("ENGINE_ATTN_FILL", "0.8")):
         # (batch x kv-heads) already fills the machine; splitting only buys a
         # second launch. Measured: b=16 is ~1% faster at one split.
         splits = 1
@@ -462,7 +498,9 @@ def flash_decode(q, k_cache, v_cache, seq_len_t, start_t, workspace, sm_scale):
         acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
         lsum.stride(0), lsum.stride(1), lsum.stride(2),
         N_KV=hkv, G=g, GP=group_pad(hq, hkv), D=d, BLOCK_N=block_n, CHUNK=chunk,
-        SPLITS_ONE=(splits == 1), num_warps=4, num_stages=2,
+        SPLITS_ONE=(splits == 1),
+        num_warps=int(os.environ.get("ENGINE_ATTN_WARPS", "8")),
+        num_stages=int(os.environ.get("ENGINE_ATTN_STAGES", "3")),
     )
     if splits == 1:
         return out

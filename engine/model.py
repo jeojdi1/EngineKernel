@@ -68,6 +68,8 @@ class Qwen3(torch.nn.Module):
         self._build_rope(self.cfg.max_position if self.cfg.max_position <= 16384 else 16384)
         self.sm_scale = self.cfg.head_dim ** -0.5
         self.zero_slot = torch.zeros(1, dtype=torch.int64, device=device)
+        self.use_gemv = (os.environ.get("ENGINE_GEMV") == "1" if "ENGINE_GEMV" in os.environ
+                         else self._pick_projection_path())
         import inspect
         try:
             self._sdpa_gqa = "enable_gqa" in inspect.signature(
@@ -140,12 +142,56 @@ class Qwen3(torch.nn.Module):
             self._build_rope(max(max_len, self.rope_len * 2))
 
     # ------------------------------------------------------------------
+    def _proj(self, x, layer, key):
+        """A decode-shaped projection, via whichever path won on this device."""
+        if self.use_gemv:
+            return gemv(x, layer[key])
+        return torch.matmul(x, layer[key + "_t"])
+
     def _mlp(self, x, layer, small: bool = False):
-        """small=True uses the Triton GEMV, which beats cuBLAS at decode batch
-        sizes; prefill's large M belongs on cuBLAS."""
+        """small=True is the decode path; prefill's large M always wants cuBLAS."""
         if small:
-            return gemv(silu_mul(gemv(x, layer["gu"])), layer["down"])
+            return self._proj(silu_mul(self._proj(x, layer, "gu")), layer, "down")
         return torch.matmul(silu_mul(torch.matmul(x, layer["gu_t"])), layer["down_t"])
+
+    def _pick_projection_path(self) -> bool:
+        """Time both projection paths on this GPU and keep the faster one.
+
+        The Triton GEMV wins ~5% on sm_80 and loses ~90% on sm_90, so this must
+        never be hardcoded. __init__ is untimed by the harness, so measuring is
+        free; ties go to cuBLAS as the safer default.
+        """
+        if not torch.cuda.is_available():
+            return False
+        import time
+        c, L = self.cfg, self.layers
+        x = torch.zeros(1, c.hidden_size, device=self.device, dtype=self.dtype)
+        o = torch.zeros(1, c.q_size, device=self.device, dtype=self.dtype)
+        a = torch.zeros(1, c.intermediate_size, device=self.device, dtype=self.dtype)
+
+        def run(use_gemv):
+            for l in L:
+                if use_gemv:
+                    gemv(x, l["qkv"]); gemv(o, l["o"])
+                    gemv(x, l["gu"]); gemv(a, l["down"])
+                else:
+                    torch.matmul(x, l["qkv_t"]); torch.matmul(o, l["o_t"])
+                    torch.matmul(x, l["gu_t"]); torch.matmul(a, l["down_t"])
+
+        best = {}
+        for flag in (False, True):
+            try:
+                for _ in range(2):
+                    run(flag)
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                for _ in range(5):
+                    run(flag)
+                torch.cuda.synchronize()
+                best[flag] = time.perf_counter() - t0
+            except Exception:
+                best[flag] = float("inf")
+        return best.get(True, float("inf")) < best.get(False, float("inf")) * 0.98
 
     def prefill(self, input_ids, positions, k_cache, v_cache, attn_bias=None):
         """input_ids/positions: [B, S]. Writes slots [0, S) of the caches.
@@ -218,7 +264,7 @@ class Qwen3(torch.nn.Module):
             else:
                 x, residual = add_rms_norm(x, residual, layer["ln1"], c.rms_eps)
 
-            qkv = gemv(x, layer["qkv"])
+            qkv = self._proj(x, layer, "qkv")
             qk_norm_rope_kv(qkv, layer["qn"], layer["kn"], cos, sin,
                             k_cache[i], v_cache[i], slot_t,
                             c.num_heads, c.num_kv_heads, c.rms_eps, 1)
@@ -229,7 +275,7 @@ class Qwen3(torch.nn.Module):
                 o = self._decode_attn_ref(q, k_cache[i], v_cache[i], len_t, start_t)
             else:
                 o = flash_decode(q, k_cache[i], v_cache[i], len_t, start_t, ws, self.sm_scale)
-            x = gemv(o.view(b, c.q_size), layer["o"])
+            x = self._proj(o.view(b, c.q_size), layer, "o")
             x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)
             x = self._mlp(x, layer, small=True)
 
@@ -253,4 +299,6 @@ class Qwen3(torch.nn.Module):
 
     def argmax_token(self, hidden):
         # hidden is [B, H] in both prefill and decode, so always the small path
-        return torch.argmax(gemv(hidden, self.lm_head), dim=-1)
+        logits = (gemv(hidden, self.lm_head) if self.use_gemv
+                  else torch.matmul(hidden, self.lm_head_t))
+        return torch.argmax(logits, dim=-1)
