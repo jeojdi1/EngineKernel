@@ -72,7 +72,7 @@ class Qwen3(torch.nn.Module):
         self.arange_q = torch.arange(64, dtype=torch.int64, device=device)
         self.use_gemv = (os.environ.get("ENGINE_GEMV") == "1" if "ENGINE_GEMV" in os.environ
                          else self._pick_projection_path())
-        if not self.use_gemv and device.type == "cuda" and os.environ.get("ENGINE_CONTIG", "1") == "1":
+        if not self.use_gemv and device.type == "cuda" and os.environ.get("ENGINE_CONTIG", "0") == "1":
             self._contiguous_weights()
         import inspect
         try:

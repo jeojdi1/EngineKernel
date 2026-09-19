@@ -132,9 +132,13 @@ if _HAS_TRITON:
         cols = blk * BLOCK + tl.arange(0, BLOCK)
         mask = cols < N
         g = tl.load(X + row * stride_xm + cols, mask=mask, other=0.0).to(tl.float32)
-        u = tl.load(X + row * stride_xm + N + cols, mask=mask, other=0.0).to(tl.float32)
-        y = (g / (1.0 + tl.exp(-g))) * u
-        tl.store(Y + row * stride_ym + cols, y.to(tl.bfloat16), mask=mask)
+        u = tl.load(X + row * stride_xm + N + cols, mask=mask, other=0.0)
+        # Rounding points follow the reference exactly: torch's bf16 silu computes
+        # in fp32 and rounds to bf16, and the product with `up` is then a bf16
+        # multiply. One fp32 multiply rounded once is more accurate and is a
+        # different function -- enough, on some prompt, to cross the tie margin.
+        act = (g / (1.0 + tl.exp(-g))).to(tl.bfloat16)
+        tl.store(Y + row * stride_ym + cols, act * u, mask=mask)
 
     @triton.jit
     def _qk_norm_rope_kv_kernel(
@@ -172,12 +176,14 @@ if _HAS_TRITON:
 
         xn = (x * rstd[:, None]).to(tl.bfloat16) * w[None, :]
         xpn = (xp * rstd[:, None]).to(tl.bfloat16) * wp[None, :]
-        rot = tl.where(cols[None, :] < HALF, -xpn.to(tl.float32), xpn.to(tl.float32))
+        rot = tl.where(cols[None, :] < HALF, -xpn, xpn)
         cos = tl.load(COS + rows[:, None] * stride_cos_m + cols[None, :],
-                      mask=rmask[:, None], other=0.0).to(tl.float32)
+                      mask=rmask[:, None], other=0.0)
         sin = tl.load(SIN + rows[:, None] * stride_cos_m + cols[None, :],
-                      mask=rmask[:, None], other=0.0).to(tl.float32)
-        out = (xn.to(tl.float32) * cos + rot * sin).to(tl.bfloat16)
+                      mask=rmask[:, None], other=0.0)
+        # reference: (q * cos) + (rotate_half(q) * sin), every op in bf16 -- two
+        # rounded products and a rounded sum, not one fp32 multiply-add
+        out = (xn * cos) + (rot * sin)
 
         if is_q:
             tl.store(base + cols[None, :], out, mask=rmask[:, None])
@@ -348,7 +354,7 @@ if _HAS_TRITON:
                 vbase + offs_n[:, None] * stride_ks + offs_d[None, :],
                 mask=nmask[:, None], other=0.0,
             )
-            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            acc = acc * alpha[:, None] + tl.dot(p, v.to(tl.float32))
             l_i = l_i * alpha + tl.sum(p, 1)
             m_i = m_new
 
@@ -427,7 +433,7 @@ if _HAS_TRITON:
             p = tl.exp(qk - m_new[:, None])
             v = tl.load(vbase + offs_n[:, None] * stride_ks + offs_d[None, :],
                         mask=nmask[:, None], other=0.0)
-            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            acc = acc * alpha[:, None] + tl.dot(p, v.to(tl.float32))
             l_i = l_i * alpha + tl.sum(p, 1)
             m_i = m_new
 
