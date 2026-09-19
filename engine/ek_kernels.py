@@ -228,6 +228,71 @@ if _HAS_TRITON:
                  mask=mmask[:, None] & nmask[None, :])
 
     @triton.jit
+    def _norm_gemv_kernel(
+        X, R, RO, NW, W, Y, M, K,
+        stride_xm, stride_rm, stride_wn, stride_ym,
+        N: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MP: tl.constexpr,
+        EPS: tl.constexpr, HAS_ADD: tl.constexpr, SILU: tl.constexpr,
+    ):
+        """[residual add] + RMSNorm + projection [+ SwiGLU], one launch.
+
+        A decode step is ~340 strictly dependent kernels and each boundary costs
+        a few microseconds of dead time, which adds up to more than a third of
+        the step. The norm cannot fuse into cuBLAS, so the projection is done
+        here and the norm becomes its prologue (every program recomputes the
+        row variance from the 2560-wide input, which is tiny next to its weight
+        tile) and, for the MLP, SwiGLU becomes its epilogue. Rounding points
+        are the reference's: bf16 residual add, fp32 norm rounded to bf16, bf16
+        gain, fp32-accumulated products rounded to bf16, fp32 silu rounded to
+        bf16, bf16 product with `up`.
+        """
+        pid = tl.program_id(0)
+        offs_m = tl.arange(0, MP)
+        mmask = offs_m < M
+
+        ss = tl.zeros([MP], tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            km = mmask[:, None] & (offs_k[None, :] < K)
+            r = tl.load(X + offs_m[:, None] * stride_xm + offs_k[None, :], mask=km, other=0.0)
+            if HAS_ADD:
+                r = r + tl.load(R + offs_m[:, None] * stride_rm + offs_k[None, :], mask=km, other=0.0)
+                if pid == 0:
+                    tl.store(RO + offs_m[:, None] * stride_rm + offs_k[None, :], r, mask=km)
+            rf = r.to(tl.float32)
+            ss += tl.sum(rf * rf, axis=1)
+        rstd = tl.rsqrt(ss / K + EPS)
+
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        nmask = offs_n < N
+        acc = tl.zeros([MP, BLOCK_N], tl.float32)
+        acc_u = tl.zeros([MP, BLOCK_N], tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            kmask = offs_k < K
+            km = mmask[:, None] & kmask[None, :]
+            r = tl.load(X + offs_m[:, None] * stride_xm + offs_k[None, :], mask=km, other=0.0)
+            if HAS_ADD:
+                r = r + tl.load(R + offs_m[:, None] * stride_rm + offs_k[None, :], mask=km, other=0.0)
+            nw = tl.load(NW + offs_k, mask=kmask, other=0.0)
+            xn = (r.to(tl.float32) * rstd[:, None]).to(tl.bfloat16) * nw[None, :]
+            w = tl.load(W + offs_n[:, None] * stride_wn + offs_k[None, :],
+                        mask=nmask[:, None] & kmask[None, :], other=0.0)
+            acc += tl.dot(xn, tl.trans(w))
+            if SILU:
+                wu = tl.load(W + (offs_n + N)[:, None] * stride_wn + offs_k[None, :],
+                             mask=nmask[:, None] & kmask[None, :], other=0.0)
+                acc_u += tl.dot(xn, tl.trans(wu))
+        om = mmask[:, None] & nmask[None, :]
+        optr = Y + offs_m[:, None] * stride_ym + offs_n[None, :]
+        if SILU:
+            g = acc.to(tl.bfloat16).to(tl.float32)
+            act = (g / (1.0 + tl.exp(-g))).to(tl.bfloat16)
+            tl.store(optr, act * acc_u.to(tl.bfloat16), mask=om)
+        else:
+            tl.store(optr, acc.to(tl.bfloat16), mask=om)
+
+    @triton.jit
     def _gemv1_kernel(
         X, W, Y, K,
         stride_wn,
@@ -679,20 +744,59 @@ def gemv1_sk(x, w, out=None, bn=64, bk=128, sk=4, warps=8, stages=3):
     return y
 
 
+def norm_gemv(x, residual, norm_w, w, eps, silu=False):
+    """y = proj(rmsnorm(x + residual)); returns (y, x + residual).
+
+    residual=None means no add (first layer): the returned residual is x itself.
+    With silu=True, w is the fused [2I, K] gate/up matrix and y is silu(gate)*up.
+    Decode-sized inputs only: the row dimension is padded to a power of two and
+    must stay below 64 on Hopper with Triton 3.1.0.
+    """
+    m, k = x.shape
+    n = w.shape[0] // 2 if silu else w.shape[0]
+    y = torch.empty(m, n, device=x.device, dtype=x.dtype)
+    has_add = residual is not None
+    r_out = torch.empty_like(x) if has_add else x
+    bn = int(os.environ.get("ENGINE_NG_BN", "0")) or (64 if silu else gemv_config(n, k)[0])
+    bk = int(os.environ.get("ENGINE_NG_BK", "0")) or 128
+    _norm_gemv_kernel[(_cdiv(n, bn),)](
+        x, residual if has_add else x, r_out, norm_w, w, y, m, k,
+        x.stride(0), (residual if has_add else x).stride(0), w.stride(0), y.stride(0),
+        N=n, BLOCK_N=bn, BLOCK_K=bk, MP=max(16, _next_pow2(m)), EPS=eps,
+        HAS_ADD=has_add, SILU=silu,
+        num_warps=int(os.environ.get("ENGINE_NG_W", "4")),
+        num_stages=int(os.environ.get("ENGINE_NG_S", "3")),
+    )
+    return y, r_out
+
+
 def gemv(x, w, out=None, cfg=None):
     """x: [M, K]; w: [N, K] (untransposed) -> [M, N]."""
     m, k = x.shape
     n = w.shape[0]
     y = torch.empty(m, n, device=x.device, dtype=x.dtype) if out is None else out
     bn, bk = cfg if cfg else gemv_config(n, k)
+    # Tuned on an H100 with Triton 3.1.0 inside a 36-layer dependent chain (a
+    # 254-config sweep, then per-shape coordinate descent). Pipeline depth was
+    # the knob earlier sweeps never pushed past 3; with it the chain runs 12%
+    # faster than cuBLAS. Wide projections want narrower blocks and fewer warps.
+    if n >= 4096:
+        t_bn, t_bk, t_w, t_s = (16, 128, 2, 5) if n < 16384 else (32, 128, 2, 7)
+    else:
+        t_bn, t_bk, t_w, t_s = 32, 256, 4, 5
+    if k % t_bk:
+        t_bk = bk
+    bn = int(os.environ.get("ENGINE_GEMV_BN", "0")) or t_bn
+    bk = int(os.environ.get("ENGINE_GEMV_BK", "0")) or t_bk
+    t_w = int(os.environ.get("ENGINE_GEMV_W", "0")) or t_w
+    t_s = int(os.environ.get("ENGINE_GEMV_S", "0")) or t_s
     # Hopper's wgmma needs M>=64; padding only to 16 drops tl.dot onto a much
     # slower path, which is why this kernel lost badly on sm_90.
     mp = max(int(os.environ.get("ENGINE_GEMV_MP", "0")) or 16, _next_pow2(m))
     _gemv_kernel[(_cdiv(n, bn),)](
         x, w, y, m, k, x.stride(0), w.stride(0), y.stride(0),
         N=n, BLOCK_N=bn, BLOCK_K=bk, MP=mp,
-        num_warps=int(os.environ.get("ENGINE_GEMV_W", "4")),
-        num_stages=int(os.environ.get("ENGINE_GEMV_S", "3")),
+        num_warps=t_w, num_stages=t_s,
     )
     return y
 

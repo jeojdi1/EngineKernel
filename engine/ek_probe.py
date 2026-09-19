@@ -42,6 +42,11 @@ def shape(b, nq, bucket, n_kv, n_heads, d) -> int:
     K.add_rms_norm(x, x.clone(), w, 1e-6)
     K.silu_mul(torch.randn(m, 2 * inter, device=dev, dtype=dt))
 
+    if m <= 32:  # the decode projections may run on the Triton GEMV at this row count
+        for n_out, k_in in ((n_heads * d + 2 * n_kv * d, hidden), (hidden, n_heads * d),
+                            (2 * inter, hidden), (hidden, inter)):
+            K.gemv(torch.randn(m, k_in, device=dev, dtype=dt), torch.randn(n_out, k_in, device=dev, dtype=dt))
+
     kc = torch.zeros(b, n_kv, bucket, d, device=dev, dtype=dt)
     vc = torch.zeros_like(kc)
     qkv = torch.randn(m, (n_heads + 2 * n_kv) * d, device=dev, dtype=dt)

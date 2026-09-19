@@ -278,6 +278,8 @@ class _FastEngine:
         g.ws = self._make_ws(b, bucket)
 
         kv = ([t[:b] for t in self.k_cache], [t[:b] for t in self.v_cache])
+        if self.triton:
+            self.model.use_gemv_for(b)  # measure now; it cannot run inside the capture below
 
         # warm up on a side stream: allocates cuBLAS workspaces and JITs Triton
         g.len_t.fill_(max(1, bucket // 2))
@@ -409,6 +411,7 @@ class _FastEngine:
                 ek_kernels.disable_triton()
                 self.triton = False
                 self.model.use_gemv = False
+                self.model._gemv_choice = {}
         if key not in self.graphs:
             self.graphs[key] = self._capture_spec(b, bucket)
         return self.graphs[key]
@@ -424,6 +427,7 @@ class _FastEngine:
                 ek_kernels.disable_triton()
                 self.triton = False
                 self.model.use_gemv = False
+                self.model._gemv_choice = {}
         if key not in self.graphs:
             self.graphs[key] = self._capture(b, bucket)
         return self.graphs[key]

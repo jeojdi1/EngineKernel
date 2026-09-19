@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 import ek_kernels
 from ek_kernels import (add_rms_norm, attn_torch, flash_decode, flash_verify, gemv,
-                        qk_norm_rope_kv, rms_norm, silu_mul)
+                        norm_gemv, qk_norm_rope_kv, rms_norm, silu_mul)
 
 
 class Qwen3Config:
@@ -70,6 +70,8 @@ class Qwen3(torch.nn.Module):
         self.sm_scale = self.cfg.head_dim ** -0.5
         self.zero_slot = torch.zeros(1024, dtype=torch.int64, device=device)
         self.arange_q = torch.arange(64, dtype=torch.int64, device=device)
+        self._gemv_choice = {}
+        self.fused = os.environ.get("ENGINE_FUSED", "0") == "1" and ek_kernels.has_triton()
         self.use_gemv = (os.environ.get("ENGINE_GEMV") == "1" if "ENGINE_GEMV" in os.environ
                          else self._pick_projection_path())
         if not self.use_gemv and device.type == "cuda" and os.environ.get("ENGINE_CONTIG", "0") == "1":
@@ -166,7 +168,7 @@ class Qwen3(torch.nn.Module):
         """A decode-shaped projection, via whichever path won on this device."""
         # gemv pads its row dimension to a power of two >= 16; keep it below 64,
         # where Triton 3.1.0 aborts the compiler on Hopper
-        if self.use_gemv and x.shape[0] <= 32:
+        if self.use_gemv_for(x.shape[0]):
             return gemv(x, layer[key])
         return torch.matmul(x, layer[key + "_t"])
 
@@ -177,43 +179,61 @@ class Qwen3(torch.nn.Module):
         return torch.matmul(silu_mul(torch.matmul(x, layer["gu_t"])), layer["down_t"])
 
     def _pick_projection_path(self) -> bool:
-        """Time both projection paths on this GPU and keep the faster one.
+        return False  # decided per batch size at first use, see use_gemv_for()
 
-        The Triton GEMV wins ~5% on sm_80 and loses ~90% on sm_90, so this must
-        never be hardcoded. __init__ is untimed by the harness, so measuring is
-        free; ties go to cuBLAS as the safer default.
+    def use_gemv_for(self, rows: int) -> bool:
+        """Triton GEMV or cuBLAS for decode projections with this many rows?
+
+        Timed back to back on this GPU at this row count, once, during the
+        untimed warmup: the winner depends on architecture, Triton version and
+        batch (on an H100 the Triton kernel wins by ~10% at 1 row and loses at
+        32), and a box that is heat-throttling shifts absolute numbers but not
+        a back-to-back comparison. Ties go to cuBLAS.
         """
-        if not (torch.cuda.is_available() and ek_kernels.has_triton()):
-            return False
-        import time
-        c, L = self.cfg, self.layers
-        x = torch.zeros(1, c.hidden_size, device=self.device, dtype=self.dtype)
-        o = torch.zeros(1, c.q_size, device=self.device, dtype=self.dtype)
-        a = torch.zeros(1, c.intermediate_size, device=self.device, dtype=self.dtype)
+        if rows in self._gemv_choice:
+            return self._gemv_choice[rows]
+        choice = False
+        forced = os.environ.get("ENGINE_GEMV")
+        if forced is not None:
+            choice = forced == "1" and rows <= 32
+        elif ek_kernels.has_triton() and self.device.type == "cuda" and rows <= 32 \
+                and self.layers[0]["qkv"] is not None:
+            import time
+            c, L = self.cfg, self.layers
+            x = torch.zeros(rows, c.hidden_size, device=self.device, dtype=self.dtype)
+            o = torch.zeros(rows, c.q_size, device=self.device, dtype=self.dtype)
+            a = torch.zeros(rows, c.intermediate_size, device=self.device, dtype=self.dtype)
 
-        def run(use_gemv):
-            for l in L:
-                if use_gemv:
-                    gemv(x, l["qkv"]); gemv(o, l["o"])
-                    gemv(x, l["gu"]); gemv(a, l["down"])
-                else:
-                    torch.matmul(x, l["qkv_t"]); torch.matmul(o, l["o_t"])
-                    torch.matmul(x, l["gu_t"]); torch.matmul(a, l["down_t"])
+            def run(tri):
+                for l in L:
+                    if tri:
+                        gemv(x, l["qkv"]); gemv(o, l["o"]); gemv(x, l["gu"]); gemv(a, l["down"])
+                    else:
+                        torch.matmul(x, l["qkv_t"]); torch.matmul(o, l["o_t"])
+                        torch.matmul(x, l["gu_t"]); torch.matmul(a, l["down_t"])
 
-        best = {}
-        for flag in (False, True):
-            try:
-                for _ in range(2):
-                    run(flag)
+            def timed(tri):
+                g = torch.cuda.CUDAGraph()
+                run(tri); torch.cuda.synchronize()
+                with torch.cuda.graph(g):
+                    run(tri)
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                for _ in range(5):
-                    run(flag)
+                for _ in range(8):
+                    g.replay()
                 torch.cuda.synchronize()
-                best[flag] = time.perf_counter() - t0
+                return time.perf_counter() - t0
+
+            try:
+                t = {False: 0.0, True: 0.0}
+                for _ in range(2):          # interleaved so drift hits both alike
+                    for tri in (False, True):
+                        t[tri] += timed(tri)
+                choice = t[True] < t[False] * 0.98
             except Exception:
-                best[flag] = float("inf")
-        return best.get(True, float("inf")) < best.get(False, float("inf")) * 0.98
+                choice = False
+        self._gemv_choice[rows] = choice
+        return choice
 
     def prefill(self, input_ids, positions, k_cache, v_cache, attn_bias=None):
         """input_ids/positions: [B, S]. Writes slots [0, S) of the caches.
@@ -266,8 +286,34 @@ class Qwen3(torch.nn.Module):
         last = residual.view(b, s, c.hidden_size)[:, -1, :]
         return rms_norm(last, self.final_norm, c.rms_eps)
 
+    def decode_fused(self, tokens, positions, k_cache, v_cache, slot_t, len_t, start_t, ws):
+        """decode() with the norms and SwiGLU folded into Triton projections:
+        6-7 dependent kernels per layer instead of 9-10."""
+        c = self.cfg
+        b = tokens.shape[0]
+        cos = self.cos.index_select(0, positions)
+        sin = self.sin.index_select(0, positions)
+        slot_t.copy_(len_t)
+        len_t.add_(1)
+        x = F.embedding(tokens, self.embed)
+        residual = None
+        for i, layer in enumerate(self.layers):
+            qkv, residual = norm_gemv(x, residual, layer["ln1"], layer["qkv"], c.rms_eps)
+            qk_norm_rope_kv(qkv, layer["qn"], layer["kn"], cos, sin,
+                            k_cache[i], v_cache[i], slot_t,
+                            c.num_heads, c.num_kv_heads, c.rms_eps, 1)
+            q = qkv[:, : c.q_size].view(b, c.num_heads, c.head_dim)
+            o = flash_decode(q, k_cache[i], v_cache[i], len_t, start_t, ws, self.sm_scale)
+            x = torch.matmul(o.view(b, c.q_size), layer["o_t"])
+            act, residual = norm_gemv(x, residual, layer["ln2"], layer["gu"], c.rms_eps, silu=True)
+            x = torch.matmul(act, layer["down_t"])
+        x, residual = add_rms_norm(x, residual, self.final_norm, c.rms_eps)
+        return x
+
     def decode(self, tokens, positions, k_cache, v_cache, slot_t, len_t, start_t, ws):
         """One decode step. tokens/positions: [B]. Everything stays on device."""
+        if self.fused and ws is not None and tokens.shape[0] <= 32:
+            return self.decode_fused(tokens, positions, k_cache, v_cache, slot_t, len_t, start_t, ws)
         c = self.cfg
         b = tokens.shape[0]
         cos = self.cos.index_select(0, positions)
@@ -358,6 +404,5 @@ class Qwen3(torch.nn.Module):
 
     def argmax_token(self, hidden):
         # hidden is [B, H] in both prefill and decode, so always the small path
-        logits = (gemv(hidden, self.lm_head) if self.use_gemv and hidden.shape[0] <= 32
-                  else torch.matmul(hidden, self.lm_head_t))
+        logits = torch.matmul(hidden, self.lm_head_t)  # cuBLAS already streams this at the ceiling
         return torch.argmax(logits, dim=-1)
