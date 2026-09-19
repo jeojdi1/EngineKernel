@@ -17,8 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch  # noqa: E402
 
-from kernels import _next_pow2, group_pad, plan_splits  # noqa: E402
-from model import Qwen3  # noqa: E402
+import ek_kernels  # noqa: E402
+from ek_kernels import _next_pow2, group_pad, plan_splits  # noqa: E402
+from ek_model import Qwen3  # noqa: E402
 
 MAX_STEPS = 4096
 LOOKAHEAD = 2
@@ -26,7 +27,27 @@ LOOKAHEAD = 2
 # lazily inside generate() only costs sample 1, which reads as timing spread.
 CAPTURE_BATCHES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 CAPTURE_BUCKETS = (1024, 2048, 4096, 8192)
-CAPTURE_SECONDS = float(os.environ.get("ENGINE_CAPTURE_BUDGET", "170"))
+CAPTURE_SECONDS = float(os.environ.get("ENGINE_CAPTURE_BUDGET", "75"))
+# Prompt+output lengths worth having a graph for before the first request when
+# the attention path is bucket-exact (the Triton-free path).
+COMMON_NEEDS = (512 + 32, 512 + 128, 2048 + 32, 2048 + 128, 1024 + 64, 1024 + 128,
+                256 + 64, 128 + 128, 4096 + 32)
+_T_IMPORT = time.perf_counter()
+
+
+def _pinned(shape, dtype):
+    """Pinned staging if the sandbox allows page-locking, pageable otherwise."""
+    try:
+        return torch.empty(shape, dtype=dtype, pin_memory=True)
+    except Exception:
+        return torch.empty(shape, dtype=dtype)
+
+
+def _rows(input_ids):
+    """Accept lists, tuples, numpy arrays or tensors; return list[list[int]]."""
+    if hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    return [r.tolist() if hasattr(r, "tolist") else [int(t) for t in r] for r in input_ids]
 TARGET_B_MAX = int(os.environ.get("ENGINE_B_MAX", "32"))
 TARGET_S_MAX = int(os.environ.get("ENGINE_S_MAX", "8192"))
 # Exact speculative decoding: an n-gram lookup over the sequence's own history
@@ -72,6 +93,8 @@ class Engine:
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
 
+        # compile-and-run probe: decides Triton kernels vs the pure-torch path
+        self.triton = ek_kernels.probe_triton() if self.cuda else False
         self.model = Qwen3(model_path, self.device)
         cfg = self.model.cfg
         self.n_kv = cfg.num_kv_heads
@@ -93,13 +116,10 @@ class Engine:
             self._alloc_cache(b_max, s_max)
             # pinned staging and events are allocated once: cudaHostAlloc costs
             # milliseconds and must not land inside a measured generate()
-            self.host_buf = torch.empty((MAX_STEPS, b_max), dtype=torch.int32,
-                                        pin_memory=True)
+            self.host_buf = _pinned((MAX_STEPS, b_max), torch.int32)
             self.events = [torch.cuda.Event() for _ in range(LOOKAHEAD + 2)]
-            self.host_tok = torch.empty((MAX_STEPS, b_max, SPEC_Q_MAX), dtype=torch.int32,
-                                        pin_memory=True)
-            self.host_adv = torch.empty((MAX_STEPS, b_max), dtype=torch.int32,
-                                        pin_memory=True)
+            self.host_tok = _pinned((MAX_STEPS, b_max, SPEC_Q_MAX), torch.int32)
+            self.host_adv = _pinned((MAX_STEPS, b_max), torch.int32)
             # graphs bake in the cos/sin pointers, so size the table once, here
             self.model.ensure_rope(self.cache_s + MAX_STEPS + 1)
             self._precapture()
@@ -136,12 +156,9 @@ class Engine:
         self.pool = torch.cuda.graph_pool_handle()
         self._alloc_cache(max(b, self.cache_b), max(_next_pow2(s), self.cache_s))
         if self.host_buf is None or self.host_buf.shape[1] < self.cache_b:
-            self.host_buf = torch.empty((MAX_STEPS, self.cache_b), dtype=torch.int32,
-                                        pin_memory=True)
-            self.host_tok = torch.empty((MAX_STEPS, self.cache_b, SPEC_Q_MAX),
-                                        dtype=torch.int32, pin_memory=True)
-            self.host_adv = torch.empty((MAX_STEPS, self.cache_b), dtype=torch.int32,
-                                        pin_memory=True)
+            self.host_buf = _pinned((MAX_STEPS, self.cache_b), torch.int32)
+            self.host_tok = _pinned((MAX_STEPS, self.cache_b, SPEC_Q_MAX), torch.int32)
+            self.host_adv = _pinned((MAX_STEPS, self.cache_b), torch.int32)
 
     # -- graph capture --------------------------------------------------
     def _make_ws(self, b: int, bucket: int):
@@ -202,6 +219,8 @@ class Engine:
         return g
 
     def _make_ws_verify(self, b: int, bucket: int, q: int):
+        if not self.triton:
+            return ("torch", bucket)
         splits, chunk, block_n = plan_splits(b, self.n_kv, bucket)
         sp = _next_pow2(splits)
         dev, hq = self.device, self.model.cfg.num_heads
@@ -293,31 +312,46 @@ class Engine:
         torch.cuda.synchronize()
         return g
 
+    def _spec_bucket(self, need: int) -> int:
+        if not self.triton:
+            # the torch attention reads the whole bucket, so keep it tight
+            return -(-need // 256) * 256
+        return next((c for c in CAPTURE_BUCKETS if c >= need), None) or _next_pow2(need)
+
     def _get_spec_graph(self, b: int, need: int):
-        bucket = next((c for c in CAPTURE_BUCKETS if c >= need), None) or _next_pow2(need)
+        bucket = self._spec_bucket(need)
         key = ("spec", b, bucket)
         if key not in self.graphs:
             self.graphs[key] = self._capture_spec(b, bucket)
         return self.graphs[key]
 
     def _precapture(self):
-        """Capture the common shapes now; __init__ is untimed, generate() is not."""
-        t0 = time.perf_counter()
-        for bucket in CAPTURE_BUCKETS:
+        """Capture likely shapes now; __init__ is untimed, generate() is not.
+
+        Ordered most-likely-first and boxed by wall clock measured from module
+        import, so a slow disk or a cold compiler cannot push load past the
+        harness's budget. Anything missed is captured lazily on first use.
+        """
+        use_spec = SPEC or not self.triton
+        order = sorted(CAPTURE_BATCHES, key=lambda b: (b not in (1, 4, 16), b))
+        if self.triton:
+            buckets = list(CAPTURE_BUCKETS)
+        else:
+            buckets = sorted({self._spec_bucket(n + SPEC_Q_MAX) for n in COMMON_NEEDS})
+        for bucket in buckets:
             if bucket > self.cache_s:
                 continue
-            for b in CAPTURE_BATCHES:
+            for b in order:
                 if b > self.cache_b:
                     continue
-                if time.perf_counter() - t0 > CAPTURE_SECONDS:
+                if time.perf_counter() - _T_IMPORT > CAPTURE_SECONDS:
                     return
                 try:
-                    if SPEC:
+                    if use_spec:
                         self.graphs[("spec", b, bucket)] = self._capture_spec(b, bucket)
                     else:
                         self.graphs[(b, bucket)] = self._capture(b, bucket)
                 except Exception:
-                    # a shape we cannot capture falls back to lazy capture later
                     torch.cuda.synchronize()
                     return
 
@@ -369,6 +403,8 @@ class Engine:
     # -- public API -----------------------------------------------------
     @torch.inference_mode()
     def generate(self, input_ids, max_new_tokens: int):
+        input_ids = _rows(input_ids)
+        max_new_tokens = int(max_new_tokens)
         b = len(input_ids)
         ids, pos, pad, s, bias = self._pack(input_ids)
         total = s + max_new_tokens
@@ -383,8 +419,11 @@ class Engine:
             yield from self._generate_eager(ids, pos, pad, s, bias, max_new_tokens)
             return
 
-        if SPEC and max_new_tokens > 1:
+        if (SPEC or not self.triton) and max_new_tokens > 1:
             yield from self._generate_spec(ids, pos, pad, s, bias, max_new_tokens)
+            return
+        if not self.triton:
+            yield from self._generate_eager(ids, pos, pad, s, bias, max_new_tokens)
             return
 
         self._ensure_cache(b, total)
@@ -432,8 +471,15 @@ class Engine:
         b = ids.shape[0]
         q = _spec_q(b)
         need = s + max_new_tokens + q
-        self._ensure_cache(b, need)
-        g = self._get_spec_graph(b, need)
+        try:
+            self._ensure_cache(b, need)
+            g = self._get_spec_graph(b, need)
+        except Exception:
+            # could not build a graph for this shape: finish the request on the
+            # plain path rather than fail the whole run
+            torch.cuda.synchronize()
+            yield from self._generate_eager(ids, pos, pad, s, bias, max_new_tokens)
+            return
 
         kv_k = [t[:b] for t in self.k_cache]
         kv_v = [t[:b] for t in self.v_cache]

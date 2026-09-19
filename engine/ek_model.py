@@ -17,8 +17,9 @@ import os
 import torch
 import torch.nn.functional as F
 
-from kernels import (add_rms_norm, flash_decode, flash_verify, gemv, qk_norm_rope_kv,
-                     rms_norm, silu_mul)
+import ek_kernels
+from ek_kernels import (add_rms_norm, attn_torch, flash_decode, flash_verify, gemv,
+                        qk_norm_rope_kv, rms_norm, silu_mul)
 
 
 class Qwen3Config:
@@ -162,7 +163,7 @@ class Qwen3(torch.nn.Module):
         never be hardcoded. __init__ is untimed by the harness, so measuring is
         free; ties go to cuBLAS as the safer default.
         """
-        if not torch.cuda.is_available():
+        if not (torch.cuda.is_available() and ek_kernels.has_triton()):
             return False
         import time
         c, L = self.cfg, self.layers
@@ -309,7 +310,10 @@ class Qwen3(torch.nn.Module):
                             k_cache[i], v_cache[i], len_b,
                             c.num_heads, c.num_kv_heads, c.rms_eps, nq)
             q = qkv[:, : c.q_size].view(b * nq, c.num_heads, c.head_dim)
-            o = flash_verify(q, k_cache[i], v_cache[i], len_b, start_t, ws, self.sm_scale, nq)
+            if ws[0] == "torch":
+                o = attn_torch(q, k_cache[i], v_cache[i], len_b, start_t, self.sm_scale, nq, ws[1])
+            else:
+                o = flash_verify(q, k_cache[i], v_cache[i], len_b, start_t, ws, self.sm_scale, nq)
             x = torch.matmul(o.view(b * nq, c.q_size), layer["o_t"])
             x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)
             x = torch.matmul(silu_mul(torch.matmul(x, layer["gu_t"])), layer["down_t"])

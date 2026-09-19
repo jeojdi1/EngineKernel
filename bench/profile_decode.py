@@ -52,7 +52,7 @@ def main():
     args = ap.parse_args()
 
     from engine import Engine
-    import kernels as K
+    import ek_kernels as K
 
     dev = torch.device("cuda")
     props = torch.cuda.get_device_properties(0)

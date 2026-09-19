@@ -7,18 +7,60 @@ The fallbacks exist so the whole model can be exercised on CPU against
 from __future__ import annotations
 
 import os
+import tempfile
 
 import torch
 
+
+def _ensure_triton_cache():
+    """Triton needs a writable cache dir; a sandbox's $HOME may not be one."""
+    if os.environ.get("TRITON_CACHE_DIR"):
+        return
+    home = os.path.join(os.path.expanduser("~"), ".triton")
+    try:
+        os.makedirs(home, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=home):
+            pass
+    except Exception:
+        os.environ["TRITON_CACHE_DIR"] = tempfile.mkdtemp(prefix="triton-")
+
+
 try:
+    if os.environ.get("ENGINE_NO_TRITON") == "1":
+        raise ImportError("disabled")
+    _ensure_triton_cache()
     import triton
     import triton.language as tl
 
     _HAS_TRITON = True
-except Exception:  # pragma: no cover - CPU-only dev boxes
+except Exception:  # pragma: no cover - CPU-only dev boxes / Triton-less sandboxes
     triton = None
     tl = None
     _HAS_TRITON = False
+
+
+def has_triton() -> bool:
+    return _HAS_TRITON
+
+
+def probe_triton() -> bool:
+    """Actually compile and run one kernel. Importing Triton proves nothing: it
+    builds its launcher with a C compiler at first use, and a slim sandbox may
+    not have one. On any failure every wrapper below drops to torch ops."""
+    global _HAS_TRITON
+    if not (_HAS_TRITON and torch.cuda.is_available()):
+        _HAS_TRITON = False
+        return False
+    try:
+        x = torch.ones(2, 64, device="cuda", dtype=torch.bfloat16)
+        w = torch.ones(64, device="cuda", dtype=torch.bfloat16)
+        y = rms_norm(x, w, 1e-6)
+        torch.cuda.synchronize()
+        if not torch.isfinite(y.float()).all():
+            raise RuntimeError("bad output")
+    except Exception:
+        _HAS_TRITON = False
+    return _HAS_TRITON
 
 
 def _next_pow2(n: int) -> int:
@@ -95,7 +137,7 @@ if _HAS_TRITON:
         M, stride_qkv_m, stride_cos_m,
         stride_cb, stride_ch, stride_cs,
         N_Q: tl.constexpr, N_KV: tl.constexpr, D: tl.constexpr,
-        HALF: tl.constexpr, EPS: tl.constexpr, M_PER_BATCH: tl.constexpr,
+        HALF: tl.constexpr, EPS: tl.constexpr, M_PER_BATCH,
         BLOCK_M: tl.constexpr,
     ):
         """Per-head QK-RMSNorm + rotary, writing k/v straight into the cache.
@@ -247,7 +289,7 @@ if _HAS_TRITON:
         stride_ab, stride_ah, stride_as, stride_ag,
         stride_lb, stride_lh, stride_ls,
         N_KV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr,
-        BLOCK_N: tl.constexpr, CHUNK: tl.constexpr, SPLITS_ONE: tl.constexpr,
+        BLOCK_N: tl.constexpr, CHUNK, SPLITS_ONE: tl.constexpr,
     ):
         """One program per (batch, kv-head, sequence-split).
 
@@ -329,8 +371,8 @@ if _HAS_TRITON:
         stride_kb, stride_kh, stride_ks,
         stride_ab, stride_ah, stride_as, stride_ag,
         stride_lb, stride_lh, stride_ls,
-        N_KV: tl.constexpr, G: tl.constexpr, NQ: tl.constexpr, GP: tl.constexpr,
-        D: tl.constexpr, BLOCK_N: tl.constexpr, CHUNK: tl.constexpr,
+        N_KV: tl.constexpr, G: tl.constexpr, NQ, GP: tl.constexpr,
+        D: tl.constexpr, BLOCK_N: tl.constexpr, CHUNK,
         SPLITS_ONE: tl.constexpr,
     ):
         """Speculative verify: NQ query tokens per sequence share one pass
@@ -403,7 +445,7 @@ if _HAS_TRITON:
         stride_ab, stride_ah, stride_as, stride_ag,
         stride_lb, stride_lh, stride_ls,
         stride_ob, stride_oh,
-        N_KV: tl.constexpr, G: tl.constexpr, NQ: tl.constexpr, D: tl.constexpr,
+        N_KV: tl.constexpr, G: tl.constexpr, NQ, D: tl.constexpr,
         SPLITS: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -526,20 +568,22 @@ def qk_norm_rope_kv(qkv, qn, kn, cos, sin, k_cache, v_cache, slot_base,
     d = qn.shape[0]
     m = qkv.shape[0]
     if not (_HAS_TRITON and qkv.is_cuda):
+        # device-side only (no .item()), so this path can sit inside a CUDA graph
         b = m // m_per_batch
+        half = d // 2
         q = qkv[:, : n_q * d].view(m, n_q, d)
         k = qkv[:, n_q * d: (n_q + n_kv) * d].view(m, n_kv, d)
         v = qkv[:, (n_q + n_kv) * d:].view(m, n_kv, d)
-        half = d // 2
+        c, sn = cos.unsqueeze(1), sin.unsqueeze(1)
         for t, w in ((q, qn), (k, kn)):
-            t.copy_(_torch_rms_norm(t, w, eps))
-            rot = torch.cat((-t[..., half:], t[..., :half]), dim=-1)
-            t.copy_(t * cos.unsqueeze(1) + rot * sin.unsqueeze(1))
-        base = int(slot_base.flatten()[0].item())
-        kk = k.view(b, m_per_batch, n_kv, d).transpose(1, 2)
-        vv = v.view(b, m_per_batch, n_kv, d).transpose(1, 2)
-        k_cache[:, :, base:base + m_per_batch].copy_(kk)
-        v_cache[:, :, base:base + m_per_batch].copy_(vv)
+            tn = _torch_rms_norm(t, w, eps)
+            rot = torch.cat((-tn[..., half:], tn[..., :half]), dim=-1)
+            t.copy_(tn * c + rot * sn)
+        ar = torch.arange(m_per_batch, device=qkv.device)
+        slots = slot_base[:b, None] + ar[None, :]
+        bi = torch.arange(b, device=qkv.device)[:, None].expand(b, m_per_batch)
+        k_cache[bi, :, slots] = k.view(b, m_per_batch, n_kv, d)
+        v_cache[bi, :, slots] = v.view(b, m_per_batch, n_kv, d)
         return qkv
     block_m = int(os.environ.get("ENGINE_ROPE_BM", "0")) or (1 if m <= 64 else 16)  # swept on sm_90
     _qk_norm_rope_kv_kernel[(_cdiv(m, block_m), n_q + 2 * n_kv)](
@@ -728,3 +772,28 @@ def flash_verify(q, k_cache, v_cache, len_b, start_t, workspace, sm_scale, nq):
         N_KV=hkv, G=g, NQ=nq, D=d, SPLITS=_next_pow2(splits), num_warps=4,
     )
     return out
+
+
+def attn_torch(q, k_cache, v_cache, len_b, start_t, sm_scale, nq, bucket):
+    """Triton-free verify/decode attention, graph-safe.
+
+    GQA is done by folding the query group into the row dimension of a bmm, so
+    K/V are never repeat-interleaved (that copy would double the step's memory
+    traffic). Reads the whole bucket and masks; the Triton path early-exits.
+    """
+    bq, hq, d = q.shape
+    b = bq // nq
+    hkv = k_cache.shape[1]
+    g = hq // hkv
+    qg = q.view(b, nq, hkv, g, d).permute(0, 2, 1, 3, 4).reshape(b, hkv, nq * g, d)
+    k = k_cache[:, :, :bucket]
+    v = v_cache[:, :, :bucket]
+    scores = torch.matmul(qg, k.transpose(-1, -2)).float() * sm_scale
+    ar = torch.arange(bucket, device=q.device)
+    qlen = len_b[:, None] + torch.arange(nq, device=q.device)[None, :] + 1
+    qlen = qlen.repeat_interleave(g, dim=1)
+    ok = (ar[None, None, :] < qlen[:, :, None]) & (ar[None, None, :] >= start_t[:, None, None])
+    scores = scores.masked_fill(~ok[:, None, :, :], float("-inf"))
+    p = torch.softmax(scores, dim=-1).to(q.dtype)
+    out = torch.matmul(p, v)
+    return out.view(b, hkv, nq, g, d).permute(0, 2, 1, 3, 4).reshape(bq, hq, d)

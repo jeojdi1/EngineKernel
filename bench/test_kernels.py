@@ -9,7 +9,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine"))
 
-import kernels as K  # noqa: E402
+import ek_kernels as K  # noqa: E402
 
 DEV = "cuda"
 FAIL = 0

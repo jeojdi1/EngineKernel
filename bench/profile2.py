@@ -36,7 +36,7 @@ def main():
     a = ap.parse_args()
 
     from engine import Engine
-    import kernels as K
+    import ek_kernels as K
     dev = torch.device("cuda")
     eng = Engine(a.model); m = eng.model; c = m.cfg; b = a.batch; L = m.layers
     peak = {"A100": 1.555, "H100": 3.35, "GH200": 4.0}

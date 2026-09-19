@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--seq", type=int, default=544)
     a = ap.parse_args()
     from engine import Engine
-    import kernels as K
+    import ek_kernels as K
     dev = torch.device("cuda")
     eng = Engine(a.model); m = eng.model; c = m.cfg; b = a.batch; L = m.layers; NL = c.num_layers
     nm = torch.cuda.get_device_name(0)

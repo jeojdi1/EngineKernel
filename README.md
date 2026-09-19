@@ -3,9 +3,9 @@
 Fast exact greedy decode for Qwen3-4B-Instruct-2507 on a single H100.
 
     engine/     the submission (this folder, and only this folder, is uploaded)
-      engine.py   Engine: cache sizing, CUDA-graph capture, generate loop
-      model.py    hand-written Qwen3 forward, fused weights, static KV cache
-      kernels.py  Triton kernels, each with a torch fallback for CPU testing
+      engine.py      Engine: startup probe, graph capture, speculative generate loop
+      ek_model.py    hand-written Qwen3 forward, fused weights, static KV cache
+      ek_kernels.py  Triton kernels, each with a graph-safe torch fallback
     bench/      local benchmark + correctness harness (never submitted)
     infra/      Lambda Cloud provisioning helpers
 
