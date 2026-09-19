@@ -17,6 +17,49 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch  # noqa: E402
 
+import gc  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+
+
+def _writable_triton_cache():
+    if os.environ.get("TRITON_CACHE_DIR"):
+        return
+    home = os.path.join(os.path.expanduser("~"), ".triton")
+    try:
+        os.makedirs(home, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=home):
+            pass
+    except Exception:
+        try:
+            os.environ["TRITON_CACHE_DIR"] = tempfile.mkdtemp(prefix="triton-")
+        except Exception:
+            os.environ["ENGINE_NO_TRITON"] = "1"
+
+
+def _probe_triton_out_of_process() -> bool:
+    """True only if a child process compiled and ran a Triton kernel.
+
+    A crash, a hang, a missing compiler, or a sandbox that forbids spawning all
+    read as "no Triton", and the engine runs on torch ops instead. Triton is
+    not even imported into this process unless the child succeeded.
+    """
+    if os.environ.get("ENGINE_NO_TRITON") == "1" or not torch.cuda.is_available():
+        return False
+    probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ek_probe.py")
+    try:
+        r = subprocess.run([sys.executable, probe], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=float(os.environ.get("ENGINE_PROBE_TIMEOUT", "150")))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+_writable_triton_cache()
+if not _probe_triton_out_of_process():
+    os.environ["ENGINE_NO_TRITON"] = "1"
+
 import ek_kernels  # noqa: E402
 from ek_kernels import _next_pow2, group_pad, plan_splits  # noqa: E402
 from ek_model import Qwen3  # noqa: E402
@@ -85,7 +128,7 @@ class _SpecGraph:
                  "arh", "arq", "ark", "zc1", "zc2")
 
 
-class Engine:
+class _FastEngine:
     @torch.inference_mode()
     def __init__(self, model_path: str) -> None:
         self.cuda = torch.cuda.is_available()
@@ -547,3 +590,72 @@ class Engine:
             tok = self.model.argmax_token(hidden)
             positions = positions + 1
             yield tok.tolist()
+
+
+class _ReferenceEngine:
+    """Plain transformers greedy loop -- what the starter ships. Slow, but known
+    to run on the platform; used only if the fast engine cannot."""
+
+    def __init__(self, model_path: str) -> None:
+        from transformers import AutoModelForCausalLM
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16).to(self.device).eval()
+
+    @torch.inference_mode()
+    def generate(self, input_ids, max_new_tokens: int):
+        ids = torch.as_tensor(_rows(input_ids), dtype=torch.long, device=self.device)
+        past = None
+        cur = ids
+        for _ in range(int(max_new_tokens)):
+            out = self.model(input_ids=cur, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            tok = out.logits[:, -1, :].argmax(dim=-1)
+            yield tok.tolist()
+            cur = tok.unsqueeze(1)
+
+
+class Engine:
+    """Submission entry point. Prefers the fast engine, never lets it take the
+    run down: a failure at load or mid-request drops to the reference loop."""
+
+    def __init__(self, model_path: str) -> None:
+        self.model_path = model_path
+        self.tier = "fast"
+        try:
+            self._impl = _FastEngine(model_path)
+        except Exception:
+            self._impl = None
+            self._use_reference()
+
+    def _use_reference(self):
+        self._impl = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        self._impl = _ReferenceEngine(self.model_path)
+        self.tier = "reference"
+
+    def generate(self, input_ids, max_new_tokens: int):
+        done = 0
+        if self.tier == "fast":
+            try:
+                for step in self._impl.generate(input_ids, max_new_tokens):
+                    done += 1
+                    yield step
+                return
+            except Exception:
+                self._use_reference()
+        # greedy decoding is deterministic, so replaying and skipping what was
+        # already emitted continues the same sequence
+        for i, step in enumerate(self._impl.generate(input_ids, max_new_tokens)):
+            if i >= done:
+                yield step
+
+    def __getattr__(self, name):  # benches read .model, .last_stats, .graphs ...
+        impl = self.__dict__.get("_impl")
+        if impl is None:
+            raise AttributeError(name)
+        return getattr(impl, name)
