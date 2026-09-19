@@ -293,6 +293,65 @@ if _HAS_TRITON:
             tl.store(optr, acc.to(tl.bfloat16), mask=om)
 
     @triton.jit
+    def _gemv_parts_kernel(
+        X, W, P, M, K, KPER,
+        stride_xm, stride_wn,
+        N: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MP: tl.constexpr,
+    ):
+        """Split-K projection: program (n-block, k-split) writes its partial dot
+        products, fp32, to P[split, row, n].
+
+        o_proj and down_proj have only 2560 outputs, so tiling over outputs alone
+        gives ~80 programs for 132 SMs and they run furthest from the bandwidth
+        ceiling. Both have long inputs (4096 / 9728), so split those across
+        programs too. The partials are summed by the add+norm kernel that
+        consumes both projections anyway, so the split costs no extra launch.
+        """
+        pn = tl.program_id(0)
+        ps = tl.program_id(1)
+        offs_n = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+        nmask = offs_n < N
+        offs_m = tl.arange(0, MP)
+        mmask = offs_m < M
+        acc = tl.zeros([MP, BLOCK_N], tl.float32)
+        hi = tl.minimum((ps + 1) * KPER, K)
+        for k0 in range(ps * KPER, hi, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            kmask = offs_k < hi
+            x = tl.load(X + offs_m[:, None] * stride_xm + offs_k[None, :],
+                        mask=mmask[:, None] & kmask[None, :], other=0.0)
+            w = tl.load(W + offs_n[:, None] * stride_wn + offs_k[None, :],
+                        mask=nmask[:, None] & kmask[None, :], other=0.0)
+            acc += tl.dot(x, tl.trans(w))
+        tl.store(P + ps * M * N + offs_m[:, None] * N + offs_n[None, :], acc,
+                 mask=mmask[:, None] & nmask[None, :])
+
+    @triton.jit
+    def _add_rms_norm_parts_kernel(
+        P, R, W, Y,
+        stride_ps, stride_rm, stride_ym,
+        N: tl.constexpr, BLOCK: tl.constexpr, EPS: tl.constexpr, SK: tl.constexpr,
+    ):
+        """add+RMSNorm whose addend arrives as SK fp32 partial sums. The sum is
+        rounded to bf16 first -- that is the projection's output in the
+        reference -- and everything after matches _add_rms_norm_kernel."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < N
+        offs_s = tl.arange(0, SK)
+        parts = tl.load(P + offs_s[:, None] * stride_ps + row * N + cols[None, :],
+                        mask=mask[None, :], other=0.0)
+        x = tl.sum(parts, axis=0).to(tl.bfloat16)
+        r = tl.load(R + row * stride_rm + cols, mask=mask, other=0.0)
+        r = (r + x).to(tl.bfloat16)
+        tl.store(R + row * stride_rm + cols, r, mask=mask)
+        rf = r.to(tl.float32)
+        rstd = tl.rsqrt(tl.sum(rf * rf, axis=0) / N + EPS)
+        xn = (rf * rstd).to(tl.bfloat16)
+        w = tl.load(W + cols, mask=mask, other=0.0)
+        tl.store(Y + row * stride_ym + cols, (xn * w).to(tl.bfloat16), mask=mask)
+
+    @triton.jit
     def _gemv1_kernel(
         X, W, Y, K,
         stride_wn,
@@ -757,17 +816,65 @@ def norm_gemv(x, residual, norm_w, w, eps, silu=False):
     y = torch.empty(m, n, device=x.device, dtype=x.dtype)
     has_add = residual is not None
     r_out = torch.empty_like(x) if has_add else x
-    bn = int(os.environ.get("ENGINE_NG_BN", "0")) or (64 if silu else gemv_config(n, k)[0])
-    bk = int(os.environ.get("ENGINE_NG_BK", "0")) or 128
+    t_bn, t_bk, t_w, t_s = gemv_tuned(w.shape[0], m, k)
+    bn = int(os.environ.get("ENGINE_NG_BN", "0")) or t_bn
+    bk = int(os.environ.get("ENGINE_NG_BK", "0")) or t_bk
     _norm_gemv_kernel[(_cdiv(n, bn),)](
         x, residual if has_add else x, r_out, norm_w, w, y, m, k,
         x.stride(0), (residual if has_add else x).stride(0), w.stride(0), y.stride(0),
         N=n, BLOCK_N=bn, BLOCK_K=bk, MP=max(16, _next_pow2(m)), EPS=eps,
         HAS_ADD=has_add, SILU=silu,
-        num_warps=int(os.environ.get("ENGINE_NG_W", "4")),
-        num_stages=int(os.environ.get("ENGINE_NG_S", "3")),
+        num_warps=int(os.environ.get("ENGINE_NG_W", "0")) or t_w,
+        num_stages=int(os.environ.get("ENGINE_NG_S", "0")) or t_s,
     )
     return y, r_out
+
+
+SPLIT_K = int(os.environ.get("ENGINE_SPLIT_K", "2"))
+
+
+def gemv_parts(x, w, sk=None):
+    """Split-K projection for the narrow-output matrices. Returns fp32 partial
+    sums [sk, M, N]; feed them to add_rms_norm_parts."""
+    m, k = x.shape
+    n = w.shape[0]
+    sk = sk or SPLIT_K
+    parts = torch.empty(sk, m, n, device=x.device, dtype=torch.float32)
+    bn = int(os.environ.get("ENGINE_SK_BN", "0")) or 64
+    bk = int(os.environ.get("ENGINE_SK_BK", "0")) or (128 if k <= 4096 else 256)
+    _gemv_parts_kernel[(_cdiv(n, bn), sk)](
+        x, w, parts, m, k, _cdiv(k, sk), x.stride(0), w.stride(0),
+        N=n, BLOCK_N=bn, BLOCK_K=bk, MP=max(16, _next_pow2(m)),
+        num_warps=int(os.environ.get("ENGINE_SK_W", "0")) or 4,
+        num_stages=int(os.environ.get("ENGINE_SK_S", "0")) or 5,
+    )
+    return parts
+
+
+def add_rms_norm_parts(parts, residual, w, eps):
+    """residual += sum(parts) (rounded to bf16 first); returns (norm * w, residual)."""
+    sk, m, n = parts.shape
+    y = torch.empty(m, n, device=parts.device, dtype=residual.dtype)
+    _add_rms_norm_parts_kernel[(m,)](
+        parts, residual, w, y, parts.stride(0), residual.stride(0), y.stride(0),
+        N=n, BLOCK=_next_pow2(n), EPS=eps, SK=sk, num_warps=8,
+    )
+    return y, residual
+
+
+def gemv_tuned(n: int, m: int, k: int = 0):
+    """(BLOCK_N, BLOCK_K, warps, stages) by projection and row count.
+
+    From per-shape coordinate descent on an H100 with Triton 3.1.0, timed in a
+    36-layer dependent chain, then a finer second pass (warps 1-4, stages 2-8).
+    """
+    if n < 4096:
+        if k > 8192:                  # down_proj
+            return (32, 512, 4, 4) if m == 1 else (32, 512, 4, 5) if m <= 16 else (32, 256, 4, 5)
+        return 32, 256, 4, 5          # o_proj
+    if n < 16384:                     # fused qkv
+        return (16, 128, 2, 5) if m == 1 else (32, 64, 2, 8) if m <= 16 else (32, 128, 2, 5)
+    return (16, 128, 1, 5) if m == 1 else (64, 128, 4, 3) if m <= 16 else (32, 128, 2, 3)   # fused gate/up
 
 
 def gemv(x, w, out=None, cfg=None):
@@ -780,15 +887,7 @@ def gemv(x, w, out=None, cfg=None):
     # 254-config sweep, then per-shape coordinate descent). Pipeline depth was
     # the knob earlier sweeps never pushed past 3; with it the chain runs 12%
     # faster than cuBLAS. Wide projections want narrower blocks and fewer warps.
-    # (BLOCK_N, BLOCK_K, warps, stages) by projection width and row count.
-    if n < 4096:                      # o_proj, down_proj: same at every batch
-        t_bn, t_bk, t_w, t_s = 32, 256, 4, 5
-    elif n < 16384:                   # fused qkv
-        t_bn, t_bk, t_w, t_s = ((16, 128, 2, 5) if m == 1 else
-                                (16, 256, 2, 3) if m <= 16 else (32, 128, 2, 5))
-    else:                             # fused gate/up
-        t_bn, t_bk, t_w, t_s = ((32, 128, 2, 7) if m == 1 else
-                                (64, 128, 4, 3) if m <= 16 else (32, 128, 2, 3))
+    t_bn, t_bk, t_w, t_s = gemv_tuned(n, m, k)
     if k % t_bk:
         t_bk = bk
     bn = int(os.environ.get("ENGINE_GEMV_BN", "0")) or t_bn

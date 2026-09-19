@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 import ek_kernels
-from ek_kernels import (add_rms_norm, attn_torch, flash_decode, flash_verify, gemv,
+from ek_kernels import (add_rms_norm, add_rms_norm_parts, attn_torch, gemv_parts, flash_decode, flash_verify, gemv,
                         norm_gemv, qk_norm_rope_kv, rms_norm, silu_mul)
 
 
@@ -71,6 +71,7 @@ class Qwen3(torch.nn.Module):
         self.zero_slot = torch.zeros(1024, dtype=torch.int64, device=device)
         self.arange_q = torch.arange(64, dtype=torch.int64, device=device)
         self._gemv_choice = {}
+        self.split_k = os.environ.get("ENGINE_SPLIT", "1") == "1"
         self.fused = os.environ.get("ENGINE_FUSED", "0") == "1" and ek_kernels.has_triton()
         self.use_gemv = (os.environ.get("ENGINE_GEMV") == "1" if "ENGINE_GEMV" in os.environ
                          else self._pick_projection_path())
@@ -312,23 +313,29 @@ class Qwen3(torch.nn.Module):
 
     def decode(self, tokens, positions, k_cache, v_cache, slot_t, len_t, start_t, ws):
         """One decode step. tokens/positions: [B]. Everything stays on device."""
-        if self.fused and ws is not None and tokens.shape[0] <= 32:
-            return self.decode_fused(tokens, positions, k_cache, v_cache, slot_t, len_t, start_t, ws)
         c = self.cfg
         b = tokens.shape[0]
+        if self.fused and ws is not None and b <= 32:
+            return self.decode_fused(tokens, positions, k_cache, v_cache, slot_t, len_t, start_t, ws)
         cos = self.cos.index_select(0, positions)
         sin = self.sin.index_select(0, positions)
+        # split-K for the two narrow projections: their partial sums are folded
+        # into the add+norm that consumes them, so it needs the Triton GEMV path
+        # measured on an H100: -2..4% per step at 4-16 rows, neutral at 1, +1% at 32
+        parts = self.split_k and ws is not None and b <= 16 and self.use_gemv_for(b)
 
         # slot_t = index this token occupies; len_t = valid length including it.
         # Both are advanced once per step so all 36 layers agree on the slot.
         slot_t.copy_(len_t)
         len_t.add_(1)
 
-        h = F.embedding(tokens, self.embed)
-        residual = h
+        residual = F.embedding(tokens, self.embed)
+        x = None
         for i, layer in enumerate(self.layers):
             if i == 0:
                 x = rms_norm(residual, layer["ln1"], c.rms_eps)
+            elif parts:
+                x, residual = add_rms_norm_parts(x, residual, layer["ln1"], c.rms_eps)
             else:
                 x, residual = add_rms_norm(x, residual, layer["ln1"], c.rms_eps)
 
@@ -338,15 +345,22 @@ class Qwen3(torch.nn.Module):
                             c.num_heads, c.num_kv_heads, c.rms_eps, 1)
 
             q = qkv[:, : c.q_size].view(b, c.num_heads, c.head_dim)
-
             if ws is None:
                 o = self._decode_attn_ref(q, k_cache[i], v_cache[i], len_t, start_t)
             else:
                 o = flash_decode(q, k_cache[i], v_cache[i], len_t, start_t, ws, self.sm_scale)
-            x = self._proj(o.view(b, c.q_size), layer, "o")
-            x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)
-            x = self._mlp(x, layer, small=True)
+            o = o.view(b, c.q_size)
+            if parts:
+                x, residual = add_rms_norm_parts(gemv_parts(o, layer["o"]), residual,
+                                                 layer["ln2"], c.rms_eps)
+                x = gemv_parts(silu_mul(self._proj(x, layer, "gu")), layer["down"])
+            else:
+                x = self._proj(o, layer, "o")
+                x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)
+                x = self._mlp(x, layer, small=True)
 
+        if parts:
+            return add_rms_norm_parts(x, residual, self.final_norm, c.rms_eps)[0]
         residual = residual + x
         return rms_norm(residual, self.final_norm, c.rms_eps)
 
