@@ -92,51 +92,58 @@ if _HAS_TRITON:
     @triton.jit
     def _qk_norm_rope_kv_kernel(
         QKV, QN, KN, COS, SIN, KC, VC, SlotBase,
-        stride_qkv_m, stride_cos_m,
+        M, stride_qkv_m, stride_cos_m,
         stride_cb, stride_ch, stride_cs,
         N_Q: tl.constexpr, N_KV: tl.constexpr, D: tl.constexpr,
         HALF: tl.constexpr, EPS: tl.constexpr, M_PER_BATCH: tl.constexpr,
+        BLOCK_M: tl.constexpr,
     ):
         """Per-head QK-RMSNorm + rotary, writing k/v straight into the cache.
 
-        Rows of QKV are [ q: N_Q*D | k: N_KV*D | v: N_KV*D ]. One program owns
-        one (row, head), so the in-place rotate-half read/write stays local.
-        Folding the cache write in here removes two index_copy_ launches per
-        layer, which at decode batch sizes cost far more than the 4 KB they move.
+        Rows of QKV are [ q: N_Q*D | k: N_KV*D | v: N_KV*D ]. Each program owns
+        BLOCK_M rows of one head: at prefill M is batch*seq, and one program per
+        (row, head) means hundreds of thousands of 128-element programs, which
+        ran ~5x off roofline. The rotate-half partner stays inside the head, so
+        the in-place read/write is still local to the program.
         """
-        r = tl.program_id(0)
+        pid_m = tl.program_id(0)
         h = tl.program_id(1)
         is_q = h < N_Q
         is_v = h >= N_Q + N_KV
 
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rmask = rows < M
         cols = tl.arange(0, D)
-        base = QKV + r * stride_qkv_m + h * D
-        x = tl.load(base + cols).to(tl.float32)
+        base = QKV + rows[:, None] * stride_qkv_m + h * D
+        x = tl.load(base + cols[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
 
-        rstd = tl.rsqrt(tl.sum(x * x, axis=0) / D + EPS)
+        rstd = tl.rsqrt(tl.sum(x * x, axis=1) / D + EPS)
         w = tl.where(is_q, tl.load(QN + cols), tl.load(KN + cols))
         idx = tl.where(cols < HALF, cols + HALF, cols - HALF)
-        xp = tl.load(base + idx).to(tl.float32)
+        xp = tl.load(base + idx[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
         wp = tl.where(is_q, tl.load(QN + idx), tl.load(KN + idx))
 
-        xn = (x * rstd).to(tl.bfloat16) * w
-        xpn = (xp * rstd).to(tl.bfloat16) * wp
-        rot = tl.where(cols < HALF, -xpn.to(tl.float32), xpn.to(tl.float32))
-        cos = tl.load(COS + r * stride_cos_m + cols).to(tl.float32)
-        sin = tl.load(SIN + r * stride_cos_m + cols).to(tl.float32)
+        xn = (x * rstd[:, None]).to(tl.bfloat16) * w[None, :]
+        xpn = (xp * rstd[:, None]).to(tl.bfloat16) * wp[None, :]
+        rot = tl.where(cols[None, :] < HALF, -xpn.to(tl.float32), xpn.to(tl.float32))
+        cos = tl.load(COS + rows[:, None] * stride_cos_m + cols[None, :],
+                      mask=rmask[:, None], other=0.0).to(tl.float32)
+        sin = tl.load(SIN + rows[:, None] * stride_cos_m + cols[None, :],
+                      mask=rmask[:, None], other=0.0).to(tl.float32)
         out = (xn.to(tl.float32) * cos + rot * sin).to(tl.bfloat16)
 
         if is_q:
-            tl.store(base + cols, out)
+            tl.store(base + cols[None, :], out, mask=rmask[:, None])
         else:
-            bidx = r // M_PER_BATCH
-            slot = r % M_PER_BATCH + tl.load(SlotBase)
+            bidx = rows // M_PER_BATCH
+            slot = rows % M_PER_BATCH + tl.load(SlotBase)
             kv_h = tl.where(is_v, h - N_Q - N_KV, h - N_Q)
-            dst = bidx * stride_cb + kv_h * stride_ch + slot * stride_cs + cols
+            dst = (bidx[:, None] * stride_cb + kv_h * stride_ch
+                   + slot[:, None] * stride_cs + cols[None, :])
             if is_v:
-                tl.store(VC + dst, x.to(tl.bfloat16))
+                tl.store(VC + dst, x.to(tl.bfloat16), mask=rmask[:, None])
             else:
-                tl.store(KC + dst, out)
+                tl.store(KC + dst, out, mask=rmask[:, None])
 
     @triton.jit
     def _gemv_kernel(
@@ -186,6 +193,48 @@ if _HAS_TRITON:
                         mask=nmask[:, None] & kmask[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(w * x[None, :], axis=1)
         tl.store(Y + offs_n, acc.to(tl.bfloat16), mask=nmask)
+
+    @triton.jit
+    def _gemv1_sk_kernel(
+        X, W, P, K,
+        stride_wn, stride_ps,
+        N: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        SPLIT_K: tl.constexpr,
+    ):
+        """Split-K partial for a single-row projection.
+
+        o_proj is N=2560: at BLOCK_N=64 that is 40 CTAs, which cannot fill 132
+        SMs, and cuBLAS reaches only ~47% of peak for the same reason. Splitting
+        K multiplies the grid by SPLIT_K. Partials are written per split and
+        summed by a separate (tiny) kernel rather than atomically, so the result
+        is deterministic run to run.
+        """
+        pid_n = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        nmask = offs_n < N
+        acc = tl.zeros([BLOCK_N], tl.float32)
+        k_per = K // SPLIT_K
+        for k0 in range(pid_k * k_per, (pid_k + 1) * k_per, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            x = tl.load(X + offs_k).to(tl.float32)
+            w = tl.load(W + offs_n[:, None] * stride_wn + offs_k[None, :],
+                        mask=nmask[:, None], other=0.0).to(tl.float32)
+            acc += tl.sum(w * x[None, :], axis=1)
+        tl.store(P + pid_k * stride_ps + offs_n, acc, mask=nmask)
+
+    @triton.jit
+    def _gemv1_sk_combine(
+        P, Y, stride_ps,
+        N: tl.constexpr, BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        nmask = offs_n < N
+        offs_s = tl.arange(0, SPLIT_K)
+        v = tl.load(P + offs_s[:, None] * stride_ps + offs_n[None, :],
+                    mask=nmask[None, :], other=0.0)
+        tl.store(Y + offs_n, tl.sum(v, axis=0).to(tl.bfloat16), mask=nmask)
 
     @triton.jit
     def _flash_decode_split_kernel(
@@ -386,12 +435,14 @@ def qk_norm_rope_kv(qkv, qn, kn, cos, sin, k_cache, v_cache, slot_base,
         k_cache[:, :, base:base + m_per_batch].copy_(kk)
         v_cache[:, :, base:base + m_per_batch].copy_(vv)
         return qkv
-    _qk_norm_rope_kv_kernel[(m, n_q + 2 * n_kv)](
+    block_m = int(os.environ.get("ENGINE_ROPE_BM", "0")) or (1 if m <= 64 else 16)  # swept on sm_90
+    _qk_norm_rope_kv_kernel[(_cdiv(m, block_m), n_q + 2 * n_kv)](
         qkv, qn, kn, cos, sin, k_cache, v_cache, slot_base,
-        qkv.stride(0), cos.stride(0),
+        m, qkv.stride(0), cos.stride(0),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         N_Q=n_q, N_KV=n_kv, D=d, HALF=d // 2, EPS=eps,
-        M_PER_BATCH=m_per_batch, num_warps=4,
+        M_PER_BATCH=m_per_batch, BLOCK_M=block_m,
+        num_warps=int(os.environ.get("ENGINE_ROPE_W", "4")),
     )
     return qkv
 
@@ -444,16 +495,43 @@ def gemv1(x, w, out=None):
     return y
 
 
+_SK_PARTIALS: dict = {}
+
+
+def gemv1_sk(x, w, out=None, bn=64, bk=128, sk=4, warps=8, stages=3):
+    """Single-row projection with split-K. x: [1, K], w: [N, K] -> [1, N]."""
+    k = x.shape[1]
+    n = w.shape[0]
+    y = torch.empty(1, n, device=x.device, dtype=x.dtype) if out is None else out
+    key = (n, sk, x.device.index)
+    p = _SK_PARTIALS.get(key)
+    if p is None:
+        p = torch.empty(sk, n, device=x.device, dtype=torch.float32)
+        _SK_PARTIALS[key] = p
+    _gemv1_sk_kernel[(_cdiv(n, bn), sk)](
+        x, w, p, k, w.stride(0), p.stride(0),
+        N=n, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=warps, num_stages=stages,
+    )
+    _gemv1_sk_combine[(_cdiv(n, 256),)](
+        p, y, p.stride(0), N=n, BLOCK_N=256, SPLIT_K=sk, num_warps=4,
+    )
+    return y
+
+
 def gemv(x, w, out=None, cfg=None):
     """x: [M, K]; w: [N, K] (untransposed) -> [M, N]."""
     m, k = x.shape
     n = w.shape[0]
     y = torch.empty(m, n, device=x.device, dtype=x.dtype) if out is None else out
     bn, bk = cfg if cfg else gemv_config(n, k)
+    # Hopper's wgmma needs M>=64; padding only to 16 drops tl.dot onto a much
+    # slower path, which is why this kernel lost badly on sm_90.
+    mp = max(int(os.environ.get("ENGINE_GEMV_MP", "0")) or 16, _next_pow2(m))
     _gemv_kernel[(_cdiv(n, bn),)](
         x, w, y, m, k, x.stride(0), w.stride(0), y.stride(0),
-        N=n, BLOCK_N=bn, BLOCK_K=bk, MP=max(16, _next_pow2(m)),
-        num_warps=4, num_stages=3,
+        N=n, BLOCK_N=bn, BLOCK_K=bk, MP=mp,
+        num_warps=int(os.environ.get("ENGINE_GEMV_W", "4")),
+        num_stages=int(os.environ.get("ENGINE_GEMV_S", "3")),
     )
     return y
 
