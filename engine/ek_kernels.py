@@ -780,10 +780,15 @@ def gemv(x, w, out=None, cfg=None):
     # 254-config sweep, then per-shape coordinate descent). Pipeline depth was
     # the knob earlier sweeps never pushed past 3; with it the chain runs 12%
     # faster than cuBLAS. Wide projections want narrower blocks and fewer warps.
-    if n >= 4096:
-        t_bn, t_bk, t_w, t_s = (16, 128, 2, 5) if n < 16384 else (32, 128, 2, 7)
-    else:
+    # (BLOCK_N, BLOCK_K, warps, stages) by projection width and row count.
+    if n < 4096:                      # o_proj, down_proj: same at every batch
         t_bn, t_bk, t_w, t_s = 32, 256, 4, 5
+    elif n < 16384:                   # fused qkv
+        t_bn, t_bk, t_w, t_s = ((16, 128, 2, 5) if m == 1 else
+                                (16, 256, 2, 3) if m <= 16 else (32, 128, 2, 5))
+    else:                             # fused gate/up
+        t_bn, t_bk, t_w, t_s = ((32, 128, 2, 7) if m == 1 else
+                                (64, 128, 4, 3) if m <= 16 else (32, 128, 2, 3))
     if k % t_bk:
         t_bk = bk
     bn = int(os.environ.get("ENGINE_GEMV_BN", "0")) or t_bn
