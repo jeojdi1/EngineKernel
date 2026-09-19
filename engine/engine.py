@@ -56,6 +56,9 @@ TARGET_S_MAX = int(os.environ.get("ENGINE_S_MAX", "8192"))
 SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"
 SPEC_Q = int(os.environ.get("ENGINE_SPEC_Q", "0"))
 SPEC_Q_MAX = 16
+# Prefill activations scale with batch*prompt tokens; rows are independent, so
+# run them in groups no larger than this. The public shapes are 8192 tokens.
+PREFILL_TOKENS = int(os.environ.get("ENGINE_PREFILL_TOKENS", "16384"))
 
 
 def _spec_q(b: int) -> int:
@@ -109,56 +112,67 @@ class Engine:
         self.cache_s = 0
 
         self.host_buf = None
+        self.host_tok = None
+        self.host_adv = None
+        self.host_b = 0
         self.last_stats = (0, 0)
-        self.events = None
+        self.events = ([torch.cuda.Event() for _ in range(LOOKAHEAD + 2)]
+                       if self.cuda else None)
         if self.cuda:
-            b_max, s_max = self._budget()
-            self._alloc_cache(b_max, s_max)
-            # pinned staging and events are allocated once: cudaHostAlloc costs
-            # milliseconds and must not land inside a measured generate()
-            self.host_buf = _pinned((MAX_STEPS, b_max), torch.int32)
-            self.events = [torch.cuda.Event() for _ in range(LOOKAHEAD + 2)]
-            self.host_tok = _pinned((MAX_STEPS, b_max, SPEC_Q_MAX), torch.int32)
-            self.host_adv = _pinned((MAX_STEPS, b_max), torch.int32)
             # graphs bake in the cos/sin pointers, so size the table once, here
-            self.model.ensure_rope(self.cache_s + MAX_STEPS + 1)
-            self._precapture()
+            self.model.ensure_rope(16384 + MAX_STEPS)
+        # Nothing shape-dependent is allocated here. Every workload starts a
+        # fresh process and gets an untimed warmup on a prompt of its own shape,
+        # so the cache and the graph are built for exactly that shape on first
+        # use. Reserving memory for guessed shapes is what made large hidden
+        # workloads die with out-of-memory next to the resident reference model.
 
     # -- memory ---------------------------------------------------------
     def _bytes_per_slot(self) -> int:
         return 2 * self.n_layers * self.n_kv * self.head_dim * 2
 
-    def _budget(self):
-        free, _total = torch.cuda.mem_get_info()
-        # leave room for prefill activations, the graph pool and fragmentation
-        usable = min(free - 14 * (1 << 30), free * 0.62)
-        slots = max(1024, int(usable // self._bytes_per_slot()))
-        b_max, s_max = TARGET_B_MAX, TARGET_S_MAX
-        while b_max * s_max > slots and s_max > 1024:
-            s_max //= 2
-        while b_max * s_max > slots and b_max > 1:
-            b_max //= 2
-        return b_max, s_max
+    def _release(self):
+        """Drop every graph and cache tensor so their memory can be reused."""
+        self.graphs.clear()
+        self.k_cache, self.v_cache = [], []
+        self.cache_b = self.cache_s = 0
+        self.pool = None
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        self.pool = torch.cuda.graph_pool_handle()
 
     def _alloc_cache(self, b: int, s: int):
-        self.k_cache, self.v_cache = [], []
-        torch.cuda.empty_cache()
         shape = (b, self.n_kv, s, self.head_dim)
-        for _ in range(self.n_layers):
-            self.k_cache.append(torch.empty(shape, dtype=torch.bfloat16, device=self.device))
-            self.v_cache.append(torch.empty(shape, dtype=torch.bfloat16, device=self.device))
+        try:
+            k = [torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+                 for _ in range(self.n_layers)]
+            v = [torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+                 for _ in range(self.n_layers)]
+        except Exception:
+            k = v = None  # a half-built cache must not outlive the failure
+            torch.cuda.empty_cache()
+            raise
+        self.k_cache, self.v_cache = k, v
         self.cache_b, self.cache_s = b, s
 
     def _ensure_cache(self, b: int, s: int):
+        """Make the cache cover (b, s), sized to the request and nothing more."""
+        s = -(-s // 256) * 256
         if b <= self.cache_b and s <= self.cache_s:
             return
-        self.graphs.clear()
-        self.pool = torch.cuda.graph_pool_handle()
-        self._alloc_cache(max(b, self.cache_b), max(_next_pow2(s), self.cache_s))
-        if self.host_buf is None or self.host_buf.shape[1] < self.cache_b:
-            self.host_buf = _pinned((MAX_STEPS, self.cache_b), torch.int32)
-            self.host_tok = _pinned((MAX_STEPS, self.cache_b, SPEC_Q_MAX), torch.int32)
-            self.host_adv = _pinned((MAX_STEPS, self.cache_b), torch.int32)
+        nb, ns = max(b, self.cache_b), max(s, self.cache_s)
+        self._release()
+        try:
+            self._alloc_cache(nb, ns)
+        except Exception:
+            self._alloc_cache(b, s)  # the union did not fit; this request alone may
+
+    def _ensure_host(self, b: int):
+        if self.host_tok is None or self.host_b < b:
+            self.host_buf = _pinned((MAX_STEPS, b), torch.int32)
+            self.host_tok = _pinned((MAX_STEPS, b, SPEC_Q_MAX), torch.int32)
+            self.host_adv = _pinned((MAX_STEPS, b), torch.int32)
+            self.host_b = b
 
     # -- graph capture --------------------------------------------------
     def _make_ws(self, b: int, bucket: int):
@@ -313,10 +327,7 @@ class Engine:
         return g
 
     def _spec_bucket(self, need: int) -> int:
-        if not self.triton:
-            # the torch attention reads the whole bucket, so keep it tight
-            return -(-need // 256) * 256
-        return next((c for c in CAPTURE_BUCKETS if c >= need), None) or _next_pow2(need)
+        return -(-need // 256) * 256
 
     def _get_spec_graph(self, b: int, need: int):
         bucket = self._spec_bucket(need)
@@ -325,48 +336,27 @@ class Engine:
             self.graphs[key] = self._capture_spec(b, bucket)
         return self.graphs[key]
 
-    def _precapture(self):
-        """Capture likely shapes now; __init__ is untimed, generate() is not.
-
-        Ordered most-likely-first and boxed by wall clock measured from module
-        import, so a slow disk or a cold compiler cannot push load past the
-        harness's budget. Anything missed is captured lazily on first use.
-        """
-        use_spec = SPEC or not self.triton
-        order = sorted(CAPTURE_BATCHES, key=lambda b: (b not in (1, 4, 16), b))
-        if self.triton:
-            buckets = list(CAPTURE_BUCKETS)
-        else:
-            buckets = sorted({self._spec_bucket(n + SPEC_Q_MAX) for n in COMMON_NEEDS})
-        for bucket in buckets:
-            if bucket > self.cache_s:
-                continue
-            for b in order:
-                if b > self.cache_b:
-                    continue
-                if time.perf_counter() - _T_IMPORT > CAPTURE_SECONDS:
-                    return
-                try:
-                    if use_spec:
-                        self.graphs[("spec", b, bucket)] = self._capture_spec(b, bucket)
-                    else:
-                        self.graphs[(b, bucket)] = self._capture(b, bucket)
-                except Exception:
-                    torch.cuda.synchronize()
-                    return
-
     def _get_graph(self, b: int, total: int):
-        bucket = None
-        for cand in CAPTURE_BUCKETS:
-            if cand >= total:
-                bucket = cand
-                break
-        if bucket is None:
-            bucket = _next_pow2(total)
+        bucket = self._spec_bucket(total)
         key = (b, bucket)
         if key not in self.graphs:
             self.graphs[key] = self._capture(b, bucket)
         return self.graphs[key]
+
+    def _prefill(self, ids, pos, k_cache, v_cache, bias):
+        """Prefill in row groups so peak activation memory does not grow with batch."""
+        b, s = ids.shape
+        rows = max(1, PREFILL_TOKENS // max(s, 1))
+        if rows >= b:
+            return self.model.prefill(ids, pos, k_cache, v_cache, bias)
+        outs = []
+        for r0 in range(0, b, rows):
+            r1 = min(b, r0 + rows)
+            outs.append(self.model.prefill(
+                ids[r0:r1], pos[r0:r1],
+                [t[r0:r1] for t in k_cache], [t[r0:r1] for t in v_cache],
+                None if bias is None else bias[r0:r1]))
+        return torch.cat(outs, dim=0)
 
     # -- inputs ---------------------------------------------------------
     def _pack(self, input_ids):
@@ -427,11 +417,12 @@ class Engine:
             return
 
         self._ensure_cache(b, total)
+        self._ensure_host(b)
         g = self._get_graph(b, total)
 
         kv_k = [t[:b] for t in self.k_cache]
         kv_v = [t[:b] for t in self.v_cache]
-        hidden = self.model.prefill(ids, pos, kv_k, kv_v, bias)
+        hidden = self._prefill(ids, pos, kv_k, kv_v, bias)
         first = self.model.argmax_token(hidden)
 
         pad_t = torch.as_tensor(pad, dtype=torch.int32)
@@ -473,17 +464,18 @@ class Engine:
         need = s + max_new_tokens + q
         try:
             self._ensure_cache(b, need)
+            self._ensure_host(b)
             g = self._get_spec_graph(b, need)
         except Exception:
             # could not build a graph for this shape: finish the request on the
             # plain path rather than fail the whole run
-            torch.cuda.synchronize()
+            self._release()
             yield from self._generate_eager(ids, pos, pad, s, bias, max_new_tokens)
             return
 
         kv_k = [t[:b] for t in self.k_cache]
         kv_v = [t[:b] for t in self.v_cache]
-        hidden = self.model.prefill(ids, pos, kv_k, kv_v, bias)
+        hidden = self._prefill(ids, pos, kv_k, kv_v, bias)
         first = self.model.argmax_token(hidden)
 
         pad_t = torch.as_tensor(pad, dtype=torch.int32)
@@ -541,7 +533,7 @@ class Engine:
              for _ in range(cfg.num_layers)]
         v = [torch.zeros(shape, dtype=self.model.dtype, device=self.device)
              for _ in range(cfg.num_layers)]
-        hidden = self.model.prefill(ids, pos, k, v, bias)
+        hidden = self._prefill(ids, pos, k, v, bias)
         tok = self.model.argmax_token(hidden)
         yield tok.tolist()
 
