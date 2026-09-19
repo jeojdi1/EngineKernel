@@ -136,7 +136,7 @@ if _HAS_TRITON:
             tl.store(base + cols[None, :], out, mask=rmask[:, None])
         else:
             bidx = rows // M_PER_BATCH
-            slot = rows % M_PER_BATCH + tl.load(SlotBase)
+            slot = rows % M_PER_BATCH + tl.load(SlotBase + bidx, mask=rmask, other=0)
             kv_h = tl.where(is_v, h - N_Q - N_KV, h - N_Q)
             dst = (bidx[:, None] * stride_cb + kv_h * stride_ch
                    + slot[:, None] * stride_cs + cols[None, :])
@@ -320,6 +320,112 @@ if _HAS_TRITON:
             tl.store(mptr + offs_g, m_i, mask=gmask)
 
     @triton.jit
+    def _flash_verify_split_kernel(
+        Q, K, V, LenB, Start,
+        Acc, Lsum, Mmax, Out,
+        sm_scale,
+        stride_qb, stride_qh,
+        stride_ob, stride_oh,
+        stride_kb, stride_kh, stride_ks,
+        stride_ab, stride_ah, stride_as, stride_ag,
+        stride_lb, stride_lh, stride_ls,
+        N_KV: tl.constexpr, G: tl.constexpr, NQ: tl.constexpr, GP: tl.constexpr,
+        D: tl.constexpr, BLOCK_N: tl.constexpr, CHUNK: tl.constexpr,
+        SPLITS_ONE: tl.constexpr,
+    ):
+        """Speculative verify: NQ query tokens per sequence share one pass
+        over that sequence's KV. Query j sees slots [start, len_b + j], so the
+        drafts are causal among themselves. All NQ*G query rows of a kv-head
+        ride the M dimension of one dot, so K/V is read once, not NQ times.
+        """
+        pid_bh = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        b = pid_bh // N_KV
+        h = pid_bh % N_KV
+
+        len_b = tl.load(LenB + b)
+        start = tl.load(Start + b)
+        lo = pid_s * CHUNK
+        hi = tl.minimum(lo + CHUNK, len_b + NQ)
+        lo = tl.maximum(lo, start)
+
+        offs_d = tl.arange(0, D)
+        offs_qi = tl.arange(0, GP)
+        qmask = offs_qi < NQ * G
+        j = offs_qi // G
+        g = offs_qi % G
+        qrow = b * NQ + j
+        qlen = len_b + j + 1
+
+        q = tl.load(
+            Q + qrow[:, None] * stride_qb + (h * G + g)[:, None] * stride_qh + offs_d[None, :],
+            mask=qmask[:, None], other=0.0,
+        )
+        m_i = tl.full([GP], -1e30, tl.float32)
+        l_i = tl.zeros([GP], tl.float32)
+        acc = tl.zeros([GP, D], tl.float32)
+        kbase = K + b * stride_kb + h * stride_kh
+        vbase = V + b * stride_kb + h * stride_kh
+
+        for n0 in range(lo, hi, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            nmask = offs_n < hi
+            k = tl.load(kbase + offs_n[:, None] * stride_ks + offs_d[None, :],
+                        mask=nmask[:, None], other=0.0)
+            qk = tl.dot(q, tl.trans(k)) * sm_scale
+            valid = nmask[None, :] & (offs_n[None, :] < qlen[:, None])
+            qk = tl.where(valid, qk, -1e30)
+            m_new = tl.maximum(m_i, tl.max(qk, 1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(qk - m_new[:, None])
+            v = tl.load(vbase + offs_n[:, None] * stride_ks + offs_d[None, :],
+                        mask=nmask[:, None], other=0.0)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            m_i = m_new
+
+        if SPLITS_ONE:
+            tl.store(Out + qrow[:, None] * stride_ob + (h * G + g)[:, None] * stride_oh
+                     + offs_d[None, :],
+                     (acc / l_i[:, None]).to(tl.bfloat16), mask=qmask[:, None])
+        else:
+            aptr = Acc + b * stride_ab + h * stride_ah + pid_s * stride_as
+            tl.store(aptr + offs_qi[:, None] * stride_ag + offs_d[None, :], acc,
+                     mask=qmask[:, None])
+            lptr = Lsum + b * stride_lb + h * stride_lh + pid_s * stride_ls
+            mptr = Mmax + b * stride_lb + h * stride_lh + pid_s * stride_ls
+            tl.store(lptr + offs_qi, l_i, mask=qmask)
+            tl.store(mptr + offs_qi, m_i, mask=qmask)
+
+    @triton.jit
+    def _flash_verify_combine_kernel(
+        Acc, Lsum, Mmax, Out,
+        stride_ab, stride_ah, stride_as, stride_ag,
+        stride_lb, stride_lh, stride_ls,
+        stride_ob, stride_oh,
+        N_KV: tl.constexpr, G: tl.constexpr, NQ: tl.constexpr, D: tl.constexpr,
+        SPLITS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        qi = pid % (NQ * G)
+        h = (pid // (NQ * G)) % N_KV
+        b = pid // (NQ * G * N_KV)
+        j = qi // G
+        g = qi % G
+        offs_d = tl.arange(0, D)
+        offs_s = tl.arange(0, SPLITS)
+        m_s = tl.load(Mmax + b * stride_lb + h * stride_lh + offs_s * stride_ls + qi)
+        l_s = tl.load(Lsum + b * stride_lb + h * stride_lh + offs_s * stride_ls + qi)
+        m = tl.max(m_s, axis=0)
+        scale = tl.exp(m_s - m)
+        denom = tl.sum(l_s * scale, axis=0)
+        a = tl.load(Acc + b * stride_ab + h * stride_ah + offs_s[:, None] * stride_as
+                    + qi * stride_ag + offs_d[None, :])
+        out = tl.sum(a * scale[:, None], axis=0) / denom
+        tl.store(Out + (b * NQ + j) * stride_ob + (h * G + g) * stride_oh + offs_d,
+                 out.to(tl.bfloat16))
+
+    @triton.jit
     def _flash_decode_combine_kernel(
         Acc, Lsum, Mmax, Out,
         stride_ab, stride_ah, stride_as, stride_ag,
@@ -415,7 +521,7 @@ def qk_norm_rope_kv(qkv, qn, kn, cos, sin, k_cache, v_cache, slot_base,
     """QK-norm + rotary on the fused QKV, with k/v written into the caches.
 
     qkv: [M, (n_q + 2*n_kv)*D]; caches: [B, n_kv, S, D]; slot_base: device int64
-    scalar added to each row's within-sequence position (0 for prefill).
+    [B], the first slot each sequence writes (zeros for prefill).
     """
     d = qn.shape[0]
     m = qkv.shape[0]
@@ -429,7 +535,7 @@ def qk_norm_rope_kv(qkv, qn, kn, cos, sin, k_cache, v_cache, slot_base,
             t.copy_(_torch_rms_norm(t, w, eps))
             rot = torch.cat((-t[..., half:], t[..., :half]), dim=-1)
             t.copy_(t * cos.unsqueeze(1) + rot * sin.unsqueeze(1))
-        base = int(slot_base.item())
+        base = int(slot_base.flatten()[0].item())
         kk = k.view(b, m_per_batch, n_kv, d).transpose(1, 2)
         vv = v.view(b, m_per_batch, n_kv, d).transpose(1, 2)
         k_cache[:, :, base:base + m_per_batch].copy_(kk)
@@ -588,5 +694,37 @@ def flash_decode(q, k_cache, v_cache, seq_len_t, start_t, workspace, sm_scale):
         lsum.stride(0), lsum.stride(1), lsum.stride(2),
         out.stride(0), out.stride(1),
         N_KV=hkv, G=g, D=d, SPLITS=_next_pow2(splits), num_warps=4,
+    )
+    return out
+
+
+def flash_verify(q, k_cache, v_cache, len_b, start_t, workspace, sm_scale, nq):
+    """q: [B*nq, HQ, D]; caches [B, HKV, S, D]; len_b/start_t: device [B]."""
+    bq, hq, d = q.shape
+    b = bq // nq
+    hkv = k_cache.shape[1]
+    g = hq // hkv
+    acc, lsum, mmax, out, splits, chunk, block_n = workspace
+    gp = acc.shape[3]
+    _flash_verify_split_kernel[(b * hkv, splits)](
+        q, k_cache, v_cache, len_b, start_t, acc, lsum, mmax, out, sm_scale,
+        q.stride(0), q.stride(1),
+        out.stride(0), out.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
+        lsum.stride(0), lsum.stride(1), lsum.stride(2),
+        N_KV=hkv, G=g, NQ=nq, GP=gp, D=d, BLOCK_N=block_n, CHUNK=chunk,
+        SPLITS_ONE=(splits == 1),
+        num_warps=int(os.environ.get("ENGINE_ATTN_WARPS", "8")),
+        num_stages=int(os.environ.get("ENGINE_ATTN_STAGES", "3")),
+    )
+    if splits == 1:
+        return out
+    _flash_verify_combine_kernel[(b * hkv * nq * g,)](
+        acc, lsum, mmax, out,
+        acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
+        lsum.stride(0), lsum.stride(1), lsum.stride(2),
+        out.stride(0), out.stride(1),
+        N_KV=hkv, G=g, NQ=nq, D=d, SPLITS=_next_pow2(splits), num_warps=4,
     )
     return out

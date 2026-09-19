@@ -17,8 +17,8 @@ import os
 import torch
 import torch.nn.functional as F
 
-from kernels import (add_rms_norm, flash_decode, gemv, qk_norm_rope_kv, rms_norm,
-                     silu_mul)
+from kernels import (add_rms_norm, flash_decode, flash_verify, gemv, qk_norm_rope_kv,
+                     rms_norm, silu_mul)
 
 
 class Qwen3Config:
@@ -67,7 +67,8 @@ class Qwen3(torch.nn.Module):
         self._load(model_path)
         self._build_rope(self.cfg.max_position if self.cfg.max_position <= 16384 else 16384)
         self.sm_scale = self.cfg.head_dim ** -0.5
-        self.zero_slot = torch.zeros(1, dtype=torch.int64, device=device)
+        self.zero_slot = torch.zeros(1024, dtype=torch.int64, device=device)
+        self.arange_q = torch.arange(64, dtype=torch.int64, device=device)
         self.use_gemv = (os.environ.get("ENGINE_GEMV") == "1" if "ENGINE_GEMV" in os.environ
                          else self._pick_projection_path())
         import inspect
@@ -281,6 +282,40 @@ class Qwen3(torch.nn.Module):
 
         residual = residual + x
         return rms_norm(residual, self.final_norm, c.rms_eps)
+
+    def verify(self, tokens, pos_b, k_cache, v_cache, len_b, start_t, ws):
+        """Score NQ tokens per sequence in one pass (speculative verify).
+
+        tokens: [B, NQ] = the last emitted token followed by NQ-1 drafts.
+        Returns the greedy token after each position, [B, NQ]. K/V for all NQ
+        inputs is written at slots len_b + j; whatever follows a rejected draft
+        is simply overwritten by the next step.
+        """
+        c = self.cfg
+        b, nq = tokens.shape
+        positions = (pos_b[:, None] + self.arange_q[None, :nq]).reshape(-1)
+        positions = positions.clamp(max=self.rope_len - 1)
+        cos = self.cos.index_select(0, positions)
+        sin = self.sin.index_select(0, positions)
+
+        residual = F.embedding(tokens.reshape(-1), self.embed)
+        for i, layer in enumerate(self.layers):
+            if i == 0:
+                x = rms_norm(residual, layer["ln1"], c.rms_eps)
+            else:
+                x, residual = add_rms_norm(x, residual, layer["ln1"], c.rms_eps)
+            qkv = torch.matmul(x, layer["qkv_t"])
+            qk_norm_rope_kv(qkv, layer["qn"], layer["kn"], cos, sin,
+                            k_cache[i], v_cache[i], len_b,
+                            c.num_heads, c.num_kv_heads, c.rms_eps, nq)
+            q = qkv[:, : c.q_size].view(b * nq, c.num_heads, c.head_dim)
+            o = flash_verify(q, k_cache[i], v_cache[i], len_b, start_t, ws, self.sm_scale, nq)
+            x = torch.matmul(o.view(b * nq, c.q_size), layer["o_t"])
+            x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)
+            x = torch.matmul(silu_mul(torch.matmul(x, layer["gu_t"])), layer["down_t"])
+        residual = residual + x
+        hidden = rms_norm(residual, self.final_norm, c.rms_eps)
+        return torch.argmax(torch.matmul(hidden, self.lm_head_t), dim=-1).view(b, nq)
 
     def _decode_attn_ref(self, q, kc, vc, len_t, start_t):
         """Torch reference for decode attention, used on CPU and in tests."""

@@ -70,7 +70,7 @@ def t_qk_norm_rope():
         kc = torch.zeros(b, nkv, smax, d, device=DEV, dtype=torch.bfloat16)
         vc = torch.zeros_like(kc)
         base = 7 if mpb == 1 else 0
-        slot = torch.tensor([base], dtype=torch.int64, device=DEV)
+        slot = torch.full((b,), base, dtype=torch.int64, device=DEV)
 
         x = qkv.float()
         gold = x.clone()

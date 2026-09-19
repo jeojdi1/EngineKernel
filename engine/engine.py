@@ -29,11 +29,29 @@ CAPTURE_BUCKETS = (1024, 2048, 4096, 8192)
 CAPTURE_SECONDS = float(os.environ.get("ENGINE_CAPTURE_BUDGET", "170"))
 TARGET_B_MAX = int(os.environ.get("ENGINE_B_MAX", "32"))
 TARGET_S_MAX = int(os.environ.get("ENGINE_S_MAX", "8192"))
+# Exact speculative decoding: an n-gram lookup over the sequence's own history
+# proposes tokens, one forward pass scores them all, and only tokens equal to
+# the model's own argmax are emitted -- so any draft, good or bad, is safe.
+SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"
+SPEC_Q_SMALL = int(os.environ.get("ENGINE_SPEC_Q_SMALL", "8"))
+SPEC_Q_LARGE = int(os.environ.get("ENGINE_SPEC_Q_LARGE", "4"))
+SPEC_Q_SPLIT = int(os.environ.get("ENGINE_SPEC_Q_SPLIT", "8"))
+SPEC_Q_MAX = 16
+
+
+def _spec_q(b: int) -> int:
+    return SPEC_Q_SMALL if b <= SPEC_Q_SPLIT else SPEC_Q_LARGE
 
 
 class _Graph:
     __slots__ = ("graph", "tokens", "positions", "slot_t", "len_t", "start_t",
                  "out_buf", "step_idx", "ws", "batch", "bucket")
+
+
+class _SpecGraph:
+    __slots__ = ("graph", "hist", "hist_len", "len_b", "pos_b", "remaining", "start_t",
+                 "out_tok", "out_adv", "step_idx", "ws", "batch", "bucket", "q",
+                 "arh", "arq", "ark", "zc1", "zc2")
 
 
 class Engine:
@@ -70,6 +88,10 @@ class Engine:
             self.host_buf = torch.empty((MAX_STEPS, b_max), dtype=torch.int32,
                                         pin_memory=True)
             self.events = [torch.cuda.Event() for _ in range(LOOKAHEAD + 2)]
+            self.host_tok = torch.empty((MAX_STEPS, b_max, SPEC_Q_MAX), dtype=torch.int32,
+                                        pin_memory=True)
+            self.host_adv = torch.empty((MAX_STEPS, b_max), dtype=torch.int32,
+                                        pin_memory=True)
             # graphs bake in the cos/sin pointers, so size the table once, here
             self.model.ensure_rope(self.cache_s + MAX_STEPS + 1)
             self._precapture()
@@ -108,6 +130,10 @@ class Engine:
         if self.host_buf is None or self.host_buf.shape[1] < self.cache_b:
             self.host_buf = torch.empty((MAX_STEPS, self.cache_b), dtype=torch.int32,
                                         pin_memory=True)
+            self.host_tok = torch.empty((MAX_STEPS, self.cache_b, SPEC_Q_MAX),
+                                        dtype=torch.int32, pin_memory=True)
+            self.host_adv = torch.empty((MAX_STEPS, self.cache_b), dtype=torch.int32,
+                                        pin_memory=True)
 
     # -- graph capture --------------------------------------------------
     def _make_ws(self, b: int, bucket: int):
@@ -137,7 +163,7 @@ class Engine:
         g.batch, g.bucket = b, bucket
         g.tokens = torch.zeros(b, dtype=torch.int64, device=dev)
         g.positions = torch.zeros(b, dtype=torch.int64, device=dev)
-        g.slot_t = torch.zeros(1, dtype=torch.int64, device=dev)
+        g.slot_t = torch.zeros(b, dtype=torch.int64, device=dev)
         g.len_t = torch.zeros(1, dtype=torch.int64, device=dev)
         g.start_t = torch.zeros(b, dtype=torch.int32, device=dev)
         g.out_buf = torch.zeros((MAX_STEPS, b), dtype=torch.int32, device=dev)
@@ -167,6 +193,101 @@ class Engine:
         torch.cuda.synchronize()
         return g
 
+    def _make_ws_verify(self, b: int, bucket: int, q: int):
+        splits, chunk, block_n = plan_splits(b, self.n_kv, bucket)
+        sp = _next_pow2(splits)
+        dev, hq = self.device, self.model.cfg.num_heads
+        gp = max(16, _next_pow2(q * (hq // self.n_kv)))
+        acc = torch.zeros((b, self.n_kv, sp, gp, self.head_dim), dtype=torch.float32, device=dev)
+        lsum = torch.zeros((b, self.n_kv, sp, gp), dtype=torch.float32, device=dev)
+        mmax = torch.full((b, self.n_kv, sp, gp), -1e30, dtype=torch.float32, device=dev)
+        out = torch.empty((b * q, hq, self.head_dim), dtype=torch.bfloat16, device=dev)
+        return (acc, lsum, mmax, out, splits, chunk, block_n)
+
+    def _spec_body(self, g: _SpecGraph, kv):
+        """Draft -> verify -> accept, entirely on device."""
+        k, v = kv
+        hsz = g.hist.shape[1]
+        big = 1 << 20
+        hl = g.hist_len
+        k_last = g.hist.gather(1, (hl - 1)[:, None])
+        k_prev = g.hist.gather(1, (hl - 2).clamp(min=0)[:, None])
+        k_pp = g.hist.gather(1, (hl - 3).clamp(min=0)[:, None])
+        # most recent earlier occurrence of the trailing 3-/2-/1-gram; longer
+        # matches outrank shorter ones, later positions outrank earlier ones
+        m1 = (g.hist == k_last) & (g.arh[None, :] <= (hl - 2)[:, None])
+        m2 = m1 & torch.cat([g.zc1, (g.hist == k_prev)[:, :-1]], dim=1)
+        m3 = m2 & torch.cat([g.zc2, (g.hist == k_pp)[:, :-2]], dim=1)
+        score = m1.long() * (g.arh + 1)[None, :] + m2.long() * big + m3.long() * (2 * big)
+        p = score.max(dim=1).values % big
+        draft = g.hist.gather(1, (p[:, None] + g.ark[None, :]).clamp(max=hsz - 1))
+        tokens = torch.cat([k_last, draft], dim=1)
+
+        am = self.model.verify(tokens, g.pos_b, k, v, g.len_b, g.start_t, g.ws)
+        nacc = (tokens[:, 1:] == am[:, :-1]).long().cumprod(dim=1).sum(dim=1)
+        adv = torch.minimum(nacc + 1, g.remaining)
+
+        g.out_tok.index_copy_(0, g.step_idx, am.to(torch.int32).unsqueeze(0))
+        g.out_adv.index_copy_(0, g.step_idx, adv.to(torch.int32).unsqueeze(0))
+        g.step_idx.add_(1)
+        g.hist.scatter_(1, (hl[:, None] + g.arq[None, :]).clamp(max=hsz - 1), am)
+        g.hist_len.add_(adv)
+        g.len_b.add_(adv)
+        g.pos_b.add_(adv)
+        g.remaining.sub_(adv)
+
+    def _capture_spec(self, b: int, bucket: int) -> _SpecGraph:
+        dev = self.device
+        q = _spec_q(b)
+        g = _SpecGraph()
+        g.batch, g.bucket, g.q = b, bucket, q
+        g.hist = torch.zeros((b, bucket), dtype=torch.int64, device=dev)
+        g.hist_len = torch.zeros(b, dtype=torch.int64, device=dev)
+        g.len_b = torch.zeros(b, dtype=torch.int64, device=dev)
+        g.pos_b = torch.zeros(b, dtype=torch.int64, device=dev)
+        g.remaining = torch.zeros(b, dtype=torch.int64, device=dev)
+        g.start_t = torch.zeros(b, dtype=torch.int32, device=dev)
+        g.out_tok = torch.zeros((MAX_STEPS, b, q), dtype=torch.int32, device=dev)
+        g.out_adv = torch.zeros((MAX_STEPS, b), dtype=torch.int32, device=dev)
+        g.step_idx = torch.zeros(1, dtype=torch.int64, device=dev)
+        g.arh = torch.arange(bucket, dtype=torch.int64, device=dev)
+        g.arq = torch.arange(q, dtype=torch.int64, device=dev)
+        g.ark = torch.arange(q - 1, dtype=torch.int64, device=dev)
+        g.zc1 = torch.zeros((b, 1), dtype=torch.bool, device=dev)
+        g.zc2 = torch.zeros((b, 2), dtype=torch.bool, device=dev)
+        g.ws = self._make_ws_verify(b, bucket, q)
+        kv = ([t[:b] for t in self.k_cache], [t[:b] for t in self.v_cache])
+
+        def reset():
+            half = max(4, bucket // 2)
+            g.hist_len.fill_(half)
+            g.len_b.fill_(half - 1)
+            g.pos_b.fill_(half - 1)
+            g.remaining.fill_(1 << 30)
+            g.step_idx.zero_()
+
+        st = torch.cuda.Stream()
+        st.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st):
+            for _ in range(3):
+                reset()
+                self._spec_body(g, kv)
+        torch.cuda.current_stream().wait_stream(st)
+        torch.cuda.synchronize()
+        reset()
+        g.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g.graph, pool=self.pool):
+            self._spec_body(g, kv)
+        torch.cuda.synchronize()
+        return g
+
+    def _get_spec_graph(self, b: int, need: int):
+        bucket = next((c for c in CAPTURE_BUCKETS if c >= need), None) or _next_pow2(need)
+        key = ("spec", b, bucket)
+        if key not in self.graphs:
+            self.graphs[key] = self._capture_spec(b, bucket)
+        return self.graphs[key]
+
     def _precapture(self):
         """Capture the common shapes now; __init__ is untimed, generate() is not."""
         t0 = time.perf_counter()
@@ -179,7 +300,10 @@ class Engine:
                 if time.perf_counter() - t0 > CAPTURE_SECONDS:
                     return
                 try:
-                    self.graphs[(b, bucket)] = self._capture(b, bucket)
+                    if SPEC:
+                        self.graphs[("spec", b, bucket)] = self._capture_spec(b, bucket)
+                    else:
+                        self.graphs[(b, bucket)] = self._capture(b, bucket)
                 except Exception:
                     # a shape we cannot capture falls back to lazy capture later
                     torch.cuda.synchronize()
@@ -247,6 +371,10 @@ class Engine:
             yield from self._generate_eager(ids, pos, pad, s, bias, max_new_tokens)
             return
 
+        if SPEC and max_new_tokens > 1:
+            yield from self._generate_spec(ids, pos, pad, s, bias, max_new_tokens)
+            return
+
         self._ensure_cache(b, total)
         g = self._get_graph(b, total)
 
@@ -288,6 +416,62 @@ class Engine:
             events[j % len(events)].synchronize()
             yield host[j, :b].tolist()
 
+    def _generate_spec(self, ids, pos, pad, s, bias, max_new_tokens):
+        b = ids.shape[0]
+        q = _spec_q(b)
+        need = s + max_new_tokens + q
+        self._ensure_cache(b, need)
+        g = self._get_spec_graph(b, need)
+
+        kv_k = [t[:b] for t in self.k_cache]
+        kv_v = [t[:b] for t in self.v_cache]
+        hidden = self.model.prefill(ids, pos, kv_k, kv_v, bias)
+        first = self.model.argmax_token(hidden)
+
+        pad_t = torch.as_tensor(pad, dtype=torch.int32)
+        g.hist[:, :s].copy_(ids)
+        g.hist[:, s].copy_(first)
+        g.hist_len.fill_(s + 1)
+        g.len_b.fill_(s)
+        g.pos_b.copy_((s - pad_t).to(torch.int64), non_blocking=True)
+        g.start_t.copy_(pad_t, non_blocking=True)
+        g.remaining.fill_(max_new_tokens - 1)
+        g.step_idx.zero_()
+
+        host_tok, host_adv, events = self.host_tok, self.host_adv, self.events
+        stream = torch.cuda.current_stream()
+        launched = 0
+        consumed = 0
+
+        def launch():
+            nonlocal launched
+            g.graph.replay()
+            host_tok[launched, :b, :q].copy_(g.out_tok[launched], non_blocking=True)
+            host_adv[launched, :b].copy_(g.out_adv[launched], non_blocking=True)
+            events[launched % len(events)].record(stream)
+            launched += 1
+
+        for _ in range(LOOKAHEAD):
+            launch()
+        yield first.to(torch.int32).cpu().tolist()
+
+        queues = [[] for _ in range(b)]
+        out_i = 0
+        target = max_new_tokens - 1
+        while out_i < target:
+            events[consumed % len(events)].synchronize()
+            toks = host_tok[consumed, :b, :q].tolist()
+            adv = host_adv[consumed, :b].tolist()
+            consumed += 1
+            for r in range(b):
+                queues[r].extend(toks[r][: adv[r]])
+            ready = min(len(x) for x in queues)
+            if ready < target and launched - consumed < LOOKAHEAD and launched < MAX_STEPS:
+                launch()
+            while out_i < ready:
+                yield [queues[r][out_i] for r in range(b)]
+                out_i += 1
+
     # -- reference path (CPU / oversized requests) ----------------------
     def _generate_eager(self, ids, pos, pad, s, bias, max_new_tokens):
         cfg = self.model.cfg
@@ -303,7 +487,7 @@ class Engine:
         yield tok.tolist()
 
         positions = torch.as_tensor([s - p for p in pad], dtype=torch.int64, device=self.device)
-        slot_t = torch.zeros(1, dtype=torch.int64, device=self.device)
+        slot_t = torch.zeros(b, dtype=torch.int64, device=self.device)
         len_t = torch.full((1,), s, dtype=torch.int64, device=self.device)
         start_t = torch.as_tensor(pad, dtype=torch.int32, device=self.device)
         ws = self._make_ws(b, total) if self.cuda else None
