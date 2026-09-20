@@ -66,6 +66,20 @@ def t_heads_to_rows():
         FAIL += not ok
 
 
+def t_attn_prefill():
+    print("attn_prefill")
+    for b, s in ((4, 2048), (16, 512), (1, 517), (2, 130)):
+        bucket = ((s + 255) // 256) * 256
+        qkv = torch.randn(b * s, 48 * 128, device="cuda", dtype=torch.bfloat16)
+        kc = torch.randn(b, 8, bucket, 128, device="cuda", dtype=torch.bfloat16)
+        vc = torch.randn(b, 8, bucket, 128, device="cuda", dtype=torch.bfloat16)
+        q = qkv[:, : 32 * 128].view(b, s, 32, 128).transpose(1, 2)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q, kc[:, :, :s], vc[:, :, :s], is_causal=True, scale=128 ** -0.5, enable_gqa=True)
+        check(f"attn_prefill b={b} s={s}", K.attn_prefill(q, kc[:, :, :s], vc[:, :, :s], 128 ** -0.5),
+              ref.transpose(1, 2).reshape(b * s, 32 * 128))
+
+
 def t_qk_norm_rope():
     print("qk_norm_rope_kv (vs fp32 gold, incl. cache writes)")
     nq, nkv, d = 32, 8, 128
@@ -147,6 +161,7 @@ if __name__ == "__main__":
     t_rms_norm()
     t_silu_mul()
     t_heads_to_rows()
+    t_attn_prefill()
     t_qk_norm_rope()
     t_flash_decode()
     print(f"\nFAILURES: {FAIL}")

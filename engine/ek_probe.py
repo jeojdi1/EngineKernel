@@ -42,6 +42,9 @@ def shape(b, nq, bucket, n_kv, n_heads, d) -> int:
     K.add_rms_norm(x, x.clone(), w, 1e-6)
     K.silu_mul(torch.randn(m, 2 * inter, device=dev, dtype=dt))
     K.heads_to_rows(torch.randn(b, n_heads, 130, d, device=dev, dtype=dt))   # prefill attention output copy
+    K.attn_prefill(torch.randn(b, n_heads, 130, d, device=dev, dtype=dt),     # Triton prefill attention
+                   torch.randn(b, n_kv, 256, d, device=dev, dtype=dt),
+                   torch.randn(b, n_kv, 256, d, device=dev, dtype=dt), d ** -0.5)
 
     if m <= 32:  # the decode projections may run on the Triton GEMV at this row count
         for n_out, k_in in ((n_heads * d + 2 * n_kv * d, hidden), (hidden, n_heads * d),
