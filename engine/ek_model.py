@@ -103,8 +103,16 @@ class Qwen3(torch.nn.Module):
             try:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
                 self._sdpa_cudnn = (sdpa_kernel, SDPBackend.CUDNN_ATTENTION)
+                # probe it once here rather than discovering mid-prefill
+                qp = torch.randn(1, self.cfg.num_heads, 64, self.cfg.head_dim, device=device, dtype=torch.bfloat16)
+                kp = torch.randn(1, self.cfg.num_kv_heads, 64, self.cfg.head_dim, device=device, dtype=torch.bfloat16)
+                with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                    F.scaled_dot_product_attention(qp, kp, kp, is_causal=True, enable_gqa=True)
+                torch.cuda.synchronize()
             except Exception:
                 self._sdpa_cudnn = None
+                # DIAGNOSTIC beacon: the platform reports peak memory, not logs
+                self._beacon_cudnn = torch.empty(1 << 30, dtype=torch.uint8, device=device)
 
     # ------------------------------------------------------------------
     def _load(self, model_path: str):

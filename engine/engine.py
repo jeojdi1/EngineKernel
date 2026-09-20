@@ -491,6 +491,9 @@ class _FastEngine:
             except Exception:
                 torch.cuda.synchronize()
                 entry = False  # do not retry a shape that would not capture
+                # DIAGNOSTIC beacon: the platform reports peak memory, not logs
+                if getattr(self, "_beacon_graph", None) is None:
+                    self._beacon_graph = torch.empty(2 << 30, dtype=torch.uint8, device=self.device)
             self.graphs[key] = entry
         if entry is False:
             return self.model.argmax_token(self._prefill(ids, pos, kv_k, kv_v, bias))
