@@ -537,6 +537,67 @@ if _HAS_TRITON:
             tl.store(mptr + offs_g, m_i, mask=gmask)
 
     @triton.jit
+    def _ngram_draft_kernel(
+        HIST, HLEN, TOK,
+        H, Q: tl.constexpr, HB: tl.constexpr, QP: tl.constexpr,
+    ):
+        """Per row: find the most recent earlier occurrence of the trailing
+        3-/2-/1-gram in the row's own history (longer match wins, then the later
+        position) and propose what followed it, wrapping around short cycles.
+        TOK[row] = [last emitted token, draft_1 .. draft_{Q-1}]. Integer-exact
+        replacement for ~25 torch launches."""
+        row = tl.program_id(0)
+        hl = tl.load(HLEN + row)
+        base = HIST + row * H
+        idx = tl.arange(0, HB)
+        inb = idx < hl
+        h = tl.load(base + idx, mask=inb, other=-1)
+        k_last = tl.load(base + hl - 1)
+        k_prev = tl.load(base + tl.maximum(hl - 2, 0))
+        k_pp = tl.load(base + tl.maximum(hl - 3, 0))
+        h1 = tl.load(base + idx - 1, mask=inb & (idx >= 1), other=-1)
+        h2 = tl.load(base + idx - 2, mask=inb & (idx >= 2), other=-1)
+        m1 = (h == k_last) & (idx <= hl - 2)
+        m2 = m1 & (h1 == k_prev) & (idx >= 1)
+        m3 = m2 & (h2 == k_pp) & (idx >= 2)
+        big = 1048576
+        score = (tl.where(m1, idx + 1, 0) + tl.where(m2, big, 0) + tl.where(m3, 2 * big, 0)).to(tl.int64)
+        p = tl.max(score, axis=0) % big
+        span = tl.maximum(hl - p, 1)
+        j = tl.arange(0, QP)
+        src = tl.minimum(p + (j - 1) % span, H - 1)
+        d = tl.load(base + src, mask=(j >= 1) & (j < Q), other=0)
+        out = tl.where(j == 0, k_last, d)
+        tl.store(TOK + row * Q + j, out, mask=j < Q)
+
+    @triton.jit
+    def _spec_accept_kernel(
+        TOK, AM, HIST, HLEN, LENB, POSB, REM, OUT_TOK, OUT_ADV, STEP,
+        H, B, Q: tl.constexpr, QP: tl.constexpr,
+    ):
+        """Per row: accept the longest draft prefix the model agrees with, then
+        do all the bookkeeping -- outputs, history, lengths, positions, budget.
+        Integer-exact replacement for ~25 torch launches."""
+        row = tl.program_id(0)
+        j = tl.arange(0, QP)
+        inq = j < Q
+        am = tl.load(AM + row * Q + j, mask=inq, other=0)
+        nxt = tl.load(TOK + row * Q + j + 1, mask=j < Q - 1, other=-1)
+        match = (nxt == am) & (j < Q - 1)
+        nacc = tl.minimum(tl.min(tl.where(match, QP, j), axis=0), Q - 1)
+        rem = tl.load(REM + row)
+        adv = tl.minimum(nacc + 1, rem)
+        step = tl.load(STEP)
+        tl.store(OUT_TOK + (step * B + row) * Q + j, am.to(tl.int32), mask=inq)
+        tl.store(OUT_ADV + step * B + row, adv.to(tl.int32))
+        hl = tl.load(HLEN + row)
+        tl.store(HIST + row * H + hl + j, am, mask=inq & (hl + j < H))
+        tl.store(HLEN + row, hl + adv)
+        tl.store(LENB + row, tl.load(LENB + row) + adv)
+        tl.store(POSB + row, tl.load(POSB + row) + adv)
+        tl.store(REM + row, rem - adv)
+
+    @triton.jit
     def _rope_attn_decode_kernel(
         QKV, QN, KN, COS, SIN, K, V, SeqLen, Start,
         Acc, Lsum, Mmax, Out,
@@ -1219,3 +1280,19 @@ def rope_attn_decode(qkv, qn, kn, cos, sin, k_cache, v_cache, seq_len_t, start_t
         N_KV=hkv, G=g, D=d, SPLITS=_next_pow2(splits), num_warps=4,
     )
     return out
+
+
+def ngram_draft(hist, hist_len, tokens):
+    """tokens[B, Q] <- [last token, Q-1 n-gram drafts] per row. All int64."""
+    b, h = hist.shape
+    q = tokens.shape[1]
+    _ngram_draft_kernel[(b,)](hist, hist_len, tokens, h, Q=q, HB=_next_pow2(h),
+                              QP=_next_pow2(max(q, 2)), num_warps=8)
+    return tokens
+
+
+def spec_accept(tokens, am, hist, hist_len, len_b, pos_b, remaining, out_tok, out_adv, step_idx):
+    b, q = tokens.shape
+    _spec_accept_kernel[(b,)](tokens, am, hist, hist_len, len_b, pos_b, remaining,
+                              out_tok, out_adv, step_idx, hist.shape[1], b,
+                              Q=q, QP=_next_pow2(max(q, 2)), num_warps=1)

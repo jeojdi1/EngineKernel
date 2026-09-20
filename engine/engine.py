@@ -136,7 +136,8 @@ PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "0") == "1"
 # CONSTRUCTION, whatever the text. Unpaced, fresh natural-text prompts gave a
 # 48-90% spread at batch 1 against the judge's 25% gate.
 SPEC_PACE = float(os.environ.get("ENGINE_SPEC_PACE", "1.2"))
-SPEC_MAX_ROWS = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "32"))   # verify rows that still fit the Triton GEMV
+SPEC_MAX_ROWS = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "32"))
+SPEC_FUSED = os.environ.get("ENGINE_SPEC_FUSED", "1") == "1"   # Triton draft/accept kernels vs ~50 torch launches   # verify rows that still fit the Triton GEMV
 
 
 def _spec_q(b: int) -> int:
@@ -164,7 +165,7 @@ class _Graph:
 
 
 class _SpecGraph:
-    __slots__ = ("graph", "hist", "hist_len", "len_b", "pos_b", "remaining", "start_t",
+    __slots__ = ("graph", "hist", "hist_len", "len_b", "pos_b", "remaining", "start_t", "tokens",
                  "out_tok", "out_adv", "step_idx", "ws", "batch", "bucket", "q",
                  "arh", "arq", "ark", "zc1", "zc2")
 
@@ -334,6 +335,13 @@ class _FastEngine:
     def _spec_body(self, g: _SpecGraph, kv):
         """Draft -> verify -> accept, entirely on device."""
         k, v = kv
+        if self.triton and SPEC_FUSED:
+            ek_kernels.ngram_draft(g.hist, g.hist_len, g.tokens)
+            am = self.model.verify(g.tokens, g.pos_b, k, v, g.len_b, g.start_t, g.ws)
+            ek_kernels.spec_accept(g.tokens, am.contiguous(), g.hist, g.hist_len, g.len_b, g.pos_b,
+                                   g.remaining, g.out_tok, g.out_adv, g.step_idx)
+            g.step_idx.add_(1)
+            return
         hsz = g.hist.shape[1]
         big = 1 << 20
         hl = g.hist_len
@@ -381,6 +389,7 @@ class _FastEngine:
         g.out_tok = torch.zeros((MAX_STEPS, b, q), dtype=torch.int32, device=dev)
         g.out_adv = torch.zeros((MAX_STEPS, b), dtype=torch.int32, device=dev)
         g.step_idx = torch.zeros(1, dtype=torch.int64, device=dev)
+        g.tokens = torch.zeros((b, q), dtype=torch.int64, device=dev)
         g.arh = torch.arange(bucket, dtype=torch.int64, device=dev)
         g.arq = torch.arange(q, dtype=torch.int64, device=dev)
         g.ark = torch.arange(q - 1, dtype=torch.int64, device=dev)

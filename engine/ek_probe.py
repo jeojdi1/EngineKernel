@@ -82,6 +82,16 @@ def shape(b, nq, bucket, n_kv, n_heads, d) -> int:
                                   torch.zeros(b, dtype=torch.int32, device=dev), ws, d ** -0.5, n_heads, 1e-6)
         torch.cuda.synchronize()
         return 0 if torch.isfinite(out.float()).all() and torch.isfinite(out2.float()).all() else 4
+    # integer kernels of the speculative step: n-gram drafting and accept bookkeeping
+    hist = torch.randint(0, 1000, (b, bucket), device=dev, dtype=torch.int64)
+    hlen = torch.full((b,), max(4, bucket // 2), dtype=torch.int64, device=dev)
+    toks = torch.zeros((b, nq), dtype=torch.int64, device=dev)
+    K.ngram_draft(hist, hlen, toks)
+    K.spec_accept(toks, toks.clone(), hist, hlen, hlen.clone(), hlen.clone(),
+                  torch.full((b,), 8, dtype=torch.int64, device=dev),
+                  torch.zeros((4, b, nq), dtype=torch.int32, device=dev),
+                  torch.zeros((4, b), dtype=torch.int32, device=dev),
+                  torch.zeros(1, dtype=torch.int64, device=dev))
     gp = max(16, K._next_pow2(nq * (n_heads // n_kv)))
     ws = (torch.zeros(b, n_kv, sp, gp, d, dtype=torch.float32, device=dev),
           torch.zeros(b, n_kv, sp, gp, dtype=torch.float32, device=dev),
