@@ -22,7 +22,9 @@ def _ensure_triton_cache():
         with tempfile.NamedTemporaryFile(dir=home):
             pass
     except Exception:
-        os.environ["TRITON_CACHE_DIR"] = tempfile.mkdtemp(prefix="triton-")
+        d = os.path.join(tempfile.gettempdir(), "ek-triton-cache")
+        os.makedirs(d, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = d
 
 
 try:
@@ -291,6 +293,44 @@ if _HAS_TRITON:
             tl.store(optr, act * acc_u.to(tl.bfloat16), mask=om)
         else:
             tl.store(optr, acc.to(tl.bfloat16), mask=om)
+
+    @triton.jit
+    def _gemv_swiglu_kernel(
+        X, W, Y, M, K,
+        stride_xm, stride_wn, stride_ym,
+        I: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MP: tl.constexpr,
+    ):
+        """Fused gate/up projection with SwiGLU as its epilogue.
+
+        W is the [2I, K] gate-over-up matrix. Each program owns a block of
+        activation outputs and computes both the gate rows and the matching up
+        rows, so silu(gate) * up is written directly and the separate SwiGLU
+        launch disappears. Same bytes streamed, half as many programs. Rounding
+        follows the reference: both projections round to bf16, silu is fp32
+        rounded to bf16, and the product is a bf16 multiply.
+        """
+        pid = tl.program_id(0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        nmask = offs_n < I
+        offs_m = tl.arange(0, MP)
+        mmask = offs_m < M
+        acc_g = tl.zeros([MP, BLOCK_N], tl.float32)
+        acc_u = tl.zeros([MP, BLOCK_N], tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            kmask = offs_k < K
+            x = tl.load(X + offs_m[:, None] * stride_xm + offs_k[None, :],
+                        mask=mmask[:, None] & kmask[None, :], other=0.0)
+            wg = tl.load(W + offs_n[:, None] * stride_wn + offs_k[None, :],
+                         mask=nmask[:, None] & kmask[None, :], other=0.0)
+            wu = tl.load(W + (offs_n + I)[:, None] * stride_wn + offs_k[None, :],
+                         mask=nmask[:, None] & kmask[None, :], other=0.0)
+            acc_g += tl.dot(x, tl.trans(wg))
+            acc_u += tl.dot(x, tl.trans(wu))
+        g = acc_g.to(tl.bfloat16).to(tl.float32)
+        act = (g / (1.0 + tl.exp(-g))).to(tl.bfloat16)
+        tl.store(Y + offs_m[:, None] * stride_ym + offs_n[None, :], act * acc_u.to(tl.bfloat16),
+                 mask=mmask[:, None] & nmask[None, :])
 
     @triton.jit
     def _gemv_parts_kernel(
@@ -831,6 +871,23 @@ def norm_gemv(x, residual, norm_w, w, eps, silu=False):
 
 
 SPLIT_K = int(os.environ.get("ENGINE_SPLIT_K", "2"))
+
+
+def gemv_swiglu(x, w):
+    """x: [M, K]; w: fused [2I, K] gate/up -> silu(x @ gate.T) * (x @ up.T), [M, I]."""
+    m, k = x.shape
+    i = w.shape[0] // 2
+    y = torch.empty(m, i, device=x.device, dtype=x.dtype)
+    t_bn, t_bk, t_w, t_s = gemv_tuned(w.shape[0], m, k)
+    bn = int(os.environ.get("ENGINE_SG_BN", "0")) or t_bn
+    bk = int(os.environ.get("ENGINE_SG_BK", "0")) or t_bk
+    _gemv_swiglu_kernel[(_cdiv(i, bn),)](
+        x, w, y, m, k, x.stride(0), w.stride(0), y.stride(0),
+        I=i, BLOCK_N=bn, BLOCK_K=bk, MP=max(16, _next_pow2(m)),
+        num_warps=int(os.environ.get("ENGINE_SG_W", "0")) or t_w,
+        num_stages=int(os.environ.get("ENGINE_SG_S", "0")) or t_s,
+    )
+    return y
 
 
 def gemv_parts(x, w, sk=None):

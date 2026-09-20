@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 import ek_kernels
-from ek_kernels import (add_rms_norm, add_rms_norm_parts, attn_torch, gemv_parts, flash_decode, flash_verify, gemv,
+from ek_kernels import (add_rms_norm, add_rms_norm_parts, attn_torch, gemv_parts, gemv_swiglu, flash_decode, flash_verify, gemv,
                         norm_gemv, qk_norm_rope_kv, rms_norm, silu_mul)
 
 
@@ -72,6 +72,7 @@ class Qwen3(torch.nn.Module):
         self.arange_q = torch.arange(64, dtype=torch.int64, device=device)
         self._gemv_choice = {}
         self.split_k = os.environ.get("ENGINE_SPLIT", "1") == "1"
+        self.fuse_swiglu = os.environ.get("ENGINE_SWIGLU", "0") == "1"
         self.fused = os.environ.get("ENGINE_FUSED", "0") == "1" and ek_kernels.has_triton()
         self.use_gemv = (os.environ.get("ENGINE_GEMV") == "1" if "ENGINE_GEMV" in os.environ
                          else self._pick_projection_path())
@@ -353,7 +354,8 @@ class Qwen3(torch.nn.Module):
             if parts:
                 x, residual = add_rms_norm_parts(gemv_parts(o, layer["o"]), residual,
                                                  layer["ln2"], c.rms_eps)
-                x = gemv_parts(silu_mul(self._proj(x, layer, "gu")), layer["down"])
+                act = gemv_swiglu(x, layer["gu"]) if self.fuse_swiglu else silu_mul(self._proj(x, layer, "gu"))
+                x = gemv_parts(act, layer["down"])
             else:
                 x = self._proj(o, layer, "o")
                 x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)

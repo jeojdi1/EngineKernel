@@ -35,7 +35,11 @@ def _writable_triton_cache():
             pass
     except Exception:
         try:
-            os.environ["TRITON_CACHE_DIR"] = tempfile.mkdtemp(prefix="triton-")
+            # fixed, not mkdtemp: every workload is a fresh process, and a random
+            # dir per process would recompile every kernel six times a run
+            d = os.path.join(tempfile.gettempdir(), "ek-triton-cache")
+            os.makedirs(d, exist_ok=True)
+            os.environ["TRITON_CACHE_DIR"] = d
         except Exception:
             os.environ["ENGINE_NO_TRITON"] = "1"
 
