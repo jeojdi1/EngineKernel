@@ -143,6 +143,27 @@ if _HAS_TRITON:
         tl.store(Y + row * stride_ym + cols, act * u, mask=mask)
 
     @triton.jit
+    def _heads_to_rows_kernel(
+        X, Y, S,
+        stride_xb, stride_xh, stride_xs, stride_yr,
+        H: tl.constexpr, D: tl.constexpr, BLOCK_S: tl.constexpr,
+    ):
+        """Y[b*S + s, h*D + d] = X[b, h, s, d]: attention output, head-major, to
+        the row layout the output projection consumes. Both sides are
+        contiguous along d, so this is a permutation of 256-byte rows."""
+        pid_bh = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        b = pid_bh // H
+        h = pid_bh % H
+        offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+        offs_d = tl.arange(0, D)
+        mask = offs_s < S
+        x = tl.load(X + b * stride_xb + h * stride_xh + offs_s[:, None] * stride_xs + offs_d[None, :],
+                    mask=mask[:, None], other=0.0)
+        tl.store(Y + (b * S + offs_s)[:, None] * stride_yr + h * D + offs_d[None, :], x,
+                 mask=mask[:, None])
+
+    @triton.jit
     def _qk_norm_rope_kv_kernel(
         QKV, QN, KN, COS, SIN, KC, VC, SlotBase,
         M, stride_qkv_m, stride_cos_m,
@@ -990,6 +1011,22 @@ def silu_mul(gu):
         x2, y, x2.stride(0), y.stride(0), N=n, BLOCK=BLOCK, num_warps=4,
     )
     return y.view(shape)
+
+
+def heads_to_rows(o):
+    """[B, H, S, D] attention output -> [B*S, H*D]. Free when the transposed
+    view is already contiguous (the flash backend's layout); cuDNN's output is
+    head-major, and torch's generic copy of it ran at ~1.3 TB/s."""
+    b, h, s, d = o.shape
+    t = o.transpose(1, 2)
+    if t.is_contiguous() or not (_HAS_TRITON and o.is_cuda):
+        return t.reshape(b * s, h * d)
+    y = torch.empty(b * s, h * d, dtype=o.dtype, device=o.device)
+    _heads_to_rows_kernel[(b * h, _cdiv(s, 64))](
+        o, y, s, o.stride(0), o.stride(1), o.stride(2), y.stride(0),
+        H=h, D=d, BLOCK_S=64, num_warps=4,
+    )
+    return y
 
 
 def qk_norm_rope_kv(qkv, qn, kn, cos, sin, k_cache, v_cache, slot_base,

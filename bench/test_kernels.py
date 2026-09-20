@@ -56,6 +56,16 @@ def t_silu_mul():
         check(f"silu_mul m={m}", K.silu_mul(gu), torch.nn.functional.silu(g) * u)
 
 
+def t_heads_to_rows():
+    global FAIL
+    print("heads_to_rows")
+    for b, h, s, d in ((16, 32, 512, 128), (4, 32, 2100, 128), (1, 32, 3, 128)):
+        o = torch.randn(b, h, s, d, device="cuda", dtype=torch.bfloat16)
+        ok = torch.equal(K.heads_to_rows(o), o.transpose(1, 2).reshape(b * s, h * d))
+        print(f"  {'ok ' if ok else 'BAD'} b={b} s={s} (bitwise)")
+        FAIL += not ok
+
+
 def t_qk_norm_rope():
     print("qk_norm_rope_kv (vs fp32 gold, incl. cache writes)")
     nq, nkv, d = 32, 8, 128
@@ -136,6 +146,7 @@ if __name__ == "__main__":
     print(f"device: {torch.cuda.get_device_name(0)}\n")
     t_rms_norm()
     t_silu_mul()
+    t_heads_to_rows()
     t_qk_norm_rope()
     t_flash_decode()
     print(f"\nFAILURES: {FAIL}")

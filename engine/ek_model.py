@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 import ek_kernels
-from ek_kernels import (add_rms_norm, add_rms_norm_parts, attn_torch, gemv_parts, gemv_swiglu,
+from ek_kernels import (add_rms_norm, add_rms_norm_parts, attn_torch, gemv_parts, gemv_swiglu, heads_to_rows,
                         rope_attn_decode, rope_attn_verify, flash_decode, flash_verify, gemv,
                         norm_gemv, qk_norm_rope_kv, rms_norm, silu_mul)
 
@@ -89,6 +89,19 @@ class Qwen3(torch.nn.Module):
                 F.scaled_dot_product_attention).parameters
         except (TypeError, ValueError):
             self._sdpa_gqa = torch.__version__ >= "2.5"
+        # cuDNN's fused attention runs the prefill at ~2x the FlashAttention-2
+        # kernel torch picks by default on an H100 (4 x 2048: 0.50 -> 0.26 ms per
+        # layer, ~530 TFLOPS). torch 2.5 ranks it below flash, so it has to be
+        # selected on its own; padded batches (an explicit mask) and any build
+        # that cannot run it fall back to the default choice.
+        self._sdpa_cudnn = None
+        if (self._sdpa_gqa and device.type == "cuda"
+                and os.environ.get("ENGINE_CUDNN_SDPA", "1") == "1"):
+            try:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+                self._sdpa_cudnn = (sdpa_kernel, SDPBackend.CUDNN_ATTENTION)
+            except Exception:
+                self._sdpa_cudnn = None
 
     # ------------------------------------------------------------------
     def _load(self, model_path: str):
@@ -242,6 +255,18 @@ class Qwen3(torch.nn.Module):
         self._gemv_choice[rows] = choice
         return choice
 
+    def _sdpa(self, q, k, v, attn_bias):
+        kw = dict(attn_mask=attn_bias, is_causal=attn_bias is None, scale=self.sm_scale,
+                  enable_gqa=True)
+        if self._sdpa_cudnn is not None and attn_bias is None:
+            sdpa_kernel, backend = self._sdpa_cudnn
+            try:
+                with sdpa_kernel(backend):
+                    return F.scaled_dot_product_attention(q, k, v, **kw)
+            except Exception:
+                self._sdpa_cudnn = None   # this build cannot run it: stay on the default
+        return F.scaled_dot_product_attention(q, k, v, **kw)
+
     def prefill(self, input_ids, positions, k_cache, v_cache, attn_bias=None):
         """input_ids/positions: [B, S]. Writes slots [0, S) of the caches.
 
@@ -270,17 +295,14 @@ class Qwen3(torch.nn.Module):
             v = v_cache[i][:, :, :s]
 
             if self._sdpa_gqa:
-                o = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_bias, is_causal=attn_bias is None,
-                    scale=self.sm_scale, enable_gqa=True,
-                )
+                o = self._sdpa(q, k, v, attn_bias)
             else:
                 rep = c.num_heads // c.num_kv_heads
                 o = F.scaled_dot_product_attention(
                     q, k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1),
                     attn_mask=attn_bias, is_causal=attn_bias is None, scale=self.sm_scale,
                 )
-            o = o.transpose(1, 2).reshape(b * s, c.q_size)
+            o = heads_to_rows(o)
 
             x = torch.matmul(o, layer["o_t"])
             x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)
