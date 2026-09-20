@@ -134,7 +134,11 @@ PREFILL_TOKENS = int(os.environ.get("ENGINE_PREFILL_TOKENS", "16384"))
 # Off: measured on an H100 it gains <1% at batch 1 (the first-token readback
 # already waits on queued decode steps, not on launch overhead) and is not yet
 # stable at batch 4.
-PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "0") == "1"
+# On: the platform runs under gVisor, where every driver call is expensive and
+# cuDNN's attention makes many per invocation; locally the captured prefill is
+# neutral (the host is never the bottleneck there), on the platform the cuDNN
+# prefill gain did not show up until the launches were folded into one replay.
+PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "1") == "1"
 
 
 # Pacing: never emit faster than SPEC_PACE tokens per verify step. A sample can
