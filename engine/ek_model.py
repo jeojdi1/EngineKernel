@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 import ek_kernels
 from ek_kernels import (add_rms_norm, add_rms_norm_parts, attn_torch, gemv_parts, gemv_swiglu,
-                        rope_attn_decode, flash_decode, flash_verify, gemv,
+                        rope_attn_decode, rope_attn_verify, flash_decode, flash_verify, gemv,
                         norm_gemv, qk_norm_rope_kv, rms_norm, silu_mul)
 
 
@@ -74,6 +74,8 @@ class Qwen3(torch.nn.Module):
         self._gemv_choice = {}
         self.split_k = os.environ.get("ENGINE_SPLIT", "1") == "1"
         self.fuse_swiglu = os.environ.get("ENGINE_SWIGLU", "0") == "1"
+        self.fuse_rope_verify = (os.environ.get("ENGINE_ROPE_VERIFY", "0") == "1"
+                                 and ek_kernels.has_triton())
         self.fuse_rope_attn = (os.environ.get("ENGINE_ROPE_ATTN", "1") == "1"
                                and ek_kernels.has_triton())
         self.fused = os.environ.get("ENGINE_FUSED", "0") == "1" and ek_kernels.has_triton()
@@ -401,14 +403,19 @@ class Qwen3(torch.nn.Module):
             else:
                 x, residual = add_rms_norm(x, residual, layer["ln1"], c.rms_eps)
             qkv = self._proj(x, layer, "qkv")
-            qk_norm_rope_kv(qkv, layer["qn"], layer["kn"], cos, sin,
-                            k_cache[i], v_cache[i], len_b,
-                            c.num_heads, c.num_kv_heads, c.rms_eps, nq)
-            q = qkv[:, : c.q_size].view(rows, c.num_heads, c.head_dim)
-            if ws[0] == "torch":
-                o = attn_torch(q, k_cache[i], v_cache[i], len_b, start_t, self.sm_scale, nq, ws[1])
+            if self.fuse_rope_verify and ws[0] != "torch":
+                o = rope_attn_verify(qkv, layer["qn"], layer["kn"], cos, sin,
+                                     k_cache[i], v_cache[i], len_b, start_t, ws,
+                                     self.sm_scale, c.num_heads, nq, c.rms_eps)
             else:
-                o = flash_verify(q, k_cache[i], v_cache[i], len_b, start_t, ws, self.sm_scale, nq)
+                qk_norm_rope_kv(qkv, layer["qn"], layer["kn"], cos, sin,
+                                k_cache[i], v_cache[i], len_b,
+                                c.num_heads, c.num_kv_heads, c.rms_eps, nq)
+                q = qkv[:, : c.q_size].view(rows, c.num_heads, c.head_dim)
+                if ws[0] == "torch":
+                    o = attn_torch(q, k_cache[i], v_cache[i], len_b, start_t, self.sm_scale, nq, ws[1])
+                else:
+                    o = flash_verify(q, k_cache[i], v_cache[i], len_b, start_t, ws, self.sm_scale, nq)
             o = o.view(rows, c.q_size)
             if parts:
                 x, residual = add_rms_norm_parts(gemv_parts(o, layer["o"]), residual,
