@@ -74,9 +74,6 @@ class Qwen3(torch.nn.Module):
         self._gemv_choice = {}
         self.split_k = os.environ.get("ENGINE_SPLIT", "1") == "1"
         self.fuse_swiglu = os.environ.get("ENGINE_SWIGLU", "0") == "1"
-        # Off: +1% at batch 1 locally, but the platform judged a run with it on
-        # incorrect_output (a store->load race inside the program, since fenced;
-        # not re-validated on the platform, where a failed run costs a slot).
         self.fuse_rope_verify = (os.environ.get("ENGINE_ROPE_VERIFY", "0") == "1"
                                  and ek_kernels.has_triton())
         self.fuse_rope_attn = (os.environ.get("ENGINE_ROPE_ATTN", "1") == "1"
@@ -103,16 +100,8 @@ class Qwen3(torch.nn.Module):
             try:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
                 self._sdpa_cudnn = (sdpa_kernel, SDPBackend.CUDNN_ATTENTION)
-                # probe it once here rather than discovering mid-prefill
-                qp = torch.randn(1, self.cfg.num_heads, 64, self.cfg.head_dim, device=device, dtype=torch.bfloat16)
-                kp = torch.randn(1, self.cfg.num_kv_heads, 64, self.cfg.head_dim, device=device, dtype=torch.bfloat16)
-                with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-                    F.scaled_dot_product_attention(qp, kp, kp, is_causal=True, enable_gqa=True)
-                torch.cuda.synchronize()
             except Exception:
                 self._sdpa_cudnn = None
-                # DIAGNOSTIC beacon: the platform reports peak memory, not logs
-                self._beacon_cudnn = torch.empty(1 << 30, dtype=torch.uint8, device=device)
 
     # ------------------------------------------------------------------
     def _load(self, model_path: str):

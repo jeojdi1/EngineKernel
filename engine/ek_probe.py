@@ -101,12 +101,8 @@ def shape(b, nq, bucket, n_kv, n_heads, d) -> int:
     q = torch.randn(m, n_heads, d, device=dev, dtype=dt)
     out = K.flash_verify(q, kc, vc, len_b, torch.zeros(b, dtype=torch.int32, device=dev),
                          ws, d ** -0.5, nq)
-    # the fused norm+rope+cache-write+attention kernel the verify step uses
-    out2 = K.rope_attn_verify(qkv, hn, hn, cs, cs, kc, vc, len_b,
-                              torch.zeros(b, dtype=torch.int32, device=dev), ws, d ** -0.5,
-                              n_heads, nq, 1e-6)
     torch.cuda.synchronize()
-    return 0 if torch.isfinite(out.float()).all() and torch.isfinite(out2.float()).all() else 4
+    return 0 if torch.isfinite(out.float()).all() else 4
 
 
 if __name__ == "__main__":

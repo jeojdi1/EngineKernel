@@ -688,9 +688,6 @@ if _HAS_TRITON:
             krot = tl.where(cols < HALF, -kpn, kpn)
             tl.store(kbase + slot * stride_ks + cols, (kn_ * cos) + (krot * sin))
             tl.store(vbase + slot * stride_ks + cols, tl.load(row + (N_Q + N_KV + h) * D + cols))
-        # the loop below streams the slot just written: every warp must see the
-        # store before any warp issues those loads
-        tl.debug_barrier()
 
         m_i = tl.full([GP], -1e30, tl.float32)
         l_i = tl.zeros([GP], tl.float32)
@@ -789,9 +786,6 @@ if _HAS_TRITON:
         qpn = (xqp * rq[:, None]).to(tl.bfloat16) * tl.load(QN + idx)[None, :]
         qrot = tl.where(cols[None, :] < HALF, -qpn, qpn)
         q = tl.where(qmask[:, None], (qn_ * cq) + (qrot * sq), 0.0).to(tl.bfloat16)
-        # the loop below streams the slots just written: every warp must see the
-        # stores before any warp issues those loads
-        tl.debug_barrier()
 
         m_i = tl.full([GP], -1e30, tl.float32)
         l_i = tl.zeros([GP], tl.float32)
