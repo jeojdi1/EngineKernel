@@ -971,9 +971,6 @@ def norm_gemv(x, residual, norm_w, w, eps, silu=False):
     return y, r_out
 
 
-SPLIT_K = int(os.environ.get("ENGINE_SPLIT_K", "2"))
-
-
 def gemv_swiglu(x, w):
     """x: [M, K]; w: fused [2I, K] gate/up -> silu(x @ gate.T) * (x @ up.T), [M, I]."""
     m, k = x.shape
@@ -991,20 +988,34 @@ def gemv_swiglu(x, w):
     return y
 
 
+def parts_tuned(k: int, m: int):
+    """(splits, BLOCK_N, BLOCK_K, warps, stages) for the split-K projections.
+    k <= 4096 is o_proj, larger is down_proj.
+
+    Chosen by alternating A/B of the whole engine on an H100, not by the
+    standalone sweep: four splits won every standalone measurement but are ~1%
+    slower than two in the real chain up to 16 rows, and 1.6% faster at 32.
+    """
+    if m <= 16:
+        return (2, 64, 128, 4, 5) if k <= 4096 else (2, 64, 256, 4, 5)
+    return (4, 16, 64, 2, 5) if k <= 4096 else (4, 32, 128, 4, 3)
+
+
 def gemv_parts(x, w, sk=None):
     """Split-K projection for the narrow-output matrices. Returns fp32 partial
     sums [sk, M, N]; feed them to add_rms_norm_parts."""
     m, k = x.shape
     n = w.shape[0]
-    sk = sk or SPLIT_K
+    t_sk, t_bn, t_bk, t_w, t_s = parts_tuned(k, m)
+    sk = sk or int(os.environ.get("ENGINE_SPLIT_K", "0")) or t_sk
     parts = torch.empty(sk, m, n, device=x.device, dtype=torch.float32)
-    bn = int(os.environ.get("ENGINE_SK_BN", "0")) or 64
-    bk = int(os.environ.get("ENGINE_SK_BK", "0")) or (128 if k <= 4096 else 256)
+    bn = int(os.environ.get("ENGINE_SK_BN", "0")) or t_bn
+    bk = int(os.environ.get("ENGINE_SK_BK", "0")) or t_bk
     _gemv_parts_kernel[(_cdiv(n, bn), sk)](
         x, w, parts, m, k, _cdiv(k, sk), x.stride(0), w.stride(0),
         N=n, BLOCK_N=bn, BLOCK_K=bk, MP=max(16, _next_pow2(m)),
-        num_warps=int(os.environ.get("ENGINE_SK_W", "0")) or 4,
-        num_stages=int(os.environ.get("ENGINE_SK_S", "0")) or 5,
+        num_warps=int(os.environ.get("ENGINE_SK_W", "0")) or t_w,
+        num_stages=int(os.environ.get("ENGINE_SK_S", "0")) or t_s,
     )
     return parts
 

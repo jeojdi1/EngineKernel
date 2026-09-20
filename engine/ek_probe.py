@@ -46,7 +46,7 @@ def shape(b, nq, bucket, n_kv, n_heads, d) -> int:
         for n_out, k_in in ((n_heads * d + 2 * n_kv * d, hidden), (hidden, n_heads * d),
                             (2 * inter, hidden), (hidden, inter)):
             K.gemv(torch.randn(m, k_in, device=dev, dtype=dt), torch.randn(n_out, k_in, device=dev, dtype=dt))
-        if m <= 16:  # split-K projections and the add+norm that sums their partials
+        if m <= 32:  # split-K projections and the add+norm that sums their partials
             for n_out, k_in in ((hidden, n_heads * d), (hidden, inter)):
                 parts = K.gemv_parts(torch.randn(m, k_in, device=dev, dtype=dt),
                                      torch.randn(n_out, k_in, device=dev, dtype=dt))

@@ -113,11 +113,12 @@ TARGET_S_MAX = int(os.environ.get("ENGINE_S_MAX", "8192"))
 # Exact speculative decoding: an n-gram lookup over the sequence's own history
 # proposes tokens, one forward pass scores them all, and only tokens equal to
 # the model's own argmax are emitted -- so any draft, good or bad, is safe.
-# Off by default. Measured on an H100 with a fresh natural-text prompt per
-# sample (what the judge does): n-gram drafts accept only 1.1-1.8 tokens/step,
-# worth ~7% throughput, while batch-1 timing spread reaches 38% against a 25%
-# gate. Random-token and repetitive prompts flattered it badly (4-10 tok/step).
-SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"
+# Paced speculation, on by default where the verify step fits the fast kernels.
+# Unpaced it was unusable: with a fresh natural-text prompt per sample (what the
+# judge does) n-gram drafts give a 48-90% timing spread at batch 1 against a 25%
+# gate. Paced at 1.2 tokens/step (see SPEC_PACE) the measured spread is 2-14%
+# and throughput is +9-13% on long outputs at batch 1-4, +5% at batch 8.
+SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"
 SPEC_Q = int(os.environ.get("ENGINE_SPEC_Q", "0"))
 SPEC_Q_MAX = 16
 # Prefill activations scale with batch*prompt tokens; rows are independent, so
@@ -129,21 +130,24 @@ PREFILL_TOKENS = int(os.environ.get("ENGINE_PREFILL_TOKENS", "16384"))
 PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "0") == "1"
 
 
-def _spec_q(b: int) -> int:
-    """Tokens scored per sequence per step (1 real + Q-1 drafts).
+# Pacing: never emit faster than SPEC_PACE tokens per verify step. A sample can
+# never run slower than 1 token/step, so the fastest and slowest samples differ
+# by at most the factor SPEC_PACE -- a timing spread of <= 20% at 1.2 BY
+# CONSTRUCTION, whatever the text. Unpaced, fresh natural-text prompts gave a
+# 48-90% spread at batch 1 against the judge's 25% gate.
+SPEC_PACE = float(os.environ.get("ENGINE_SPEC_PACE", "1.2"))
+SPEC_MAX_ROWS = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "32"))   # verify rows that still fit the Triton GEMV
 
-    Measured on sm_90: a verify step costs ~2% more per extra draft token at
-    batch <= 16 and ~5% at batch 32, while accepted tokens scale with Q whenever
-    the output is predictable. So spend a fixed budget of ~128 scored tokens
-    per step and split it across the batch.
-    """
+
+def _spec_q(b: int) -> int:
+    """Tokens scored per sequence per verify step (1 real + Q-1 drafts)."""
     if SPEC_Q:
         return SPEC_Q
-    # Q is capped at 8: with 4 query heads per KV head that pads the dot's row
-    # dimension to 32. At 64 rows Triton 3.1.0 aborts the *compiler* on Hopper
-    # ("SharedEncodingAttr builder when the MMAEncodingAttr is Hopper has not
-    # been implemented yet"), which kills the process with no exception.
-    return max(3, min(8, 128 // max(b, 1)))
+    return 3
+
+
+def _spec_ok(b: int) -> bool:
+    return b * _spec_q(b) <= SPEC_MAX_ROWS
 
 
 class _Graph:
@@ -375,6 +379,8 @@ class _FastEngine:
         g.zc1 = torch.zeros((b, 1), dtype=torch.bool, device=dev)
         g.zc2 = torch.zeros((b, 2), dtype=torch.bool, device=dev)
         g.ws = self._make_ws_verify(b, bucket, q)
+        if self.triton:
+            self.model.use_gemv_for(b * q)  # measure now; it cannot run inside the capture
         kv = ([t[:b] for t in self.k_cache], [t[:b] for t in self.v_cache])
 
         def reset():
@@ -555,7 +561,7 @@ class _FastEngine:
             yield from self._generate_eager(ids, pos, pad, s, bias, max_new_tokens)
             return
 
-        if (SPEC or not self.triton) and max_new_tokens > 1:
+        if ((SPEC and _spec_ok(b)) or not self.triton) and max_new_tokens > 1:
             yield from self._generate_spec(ids, pos, pad, s, bias, max_new_tokens)
             return
         if not self.triton:
@@ -648,8 +654,15 @@ class _FastEngine:
         queues = [[] for _ in range(b)]
         out_i = 0
         target = max_new_tokens - 1
-        while out_i < target:
+        ready = 0
+        t_prev = time.perf_counter()
+        step_times = []
+        while out_i < target and ready < target:
             events[consumed % len(events)].synchronize()
+            now = time.perf_counter()
+            if consumed:
+                step_times.append(now - t_prev)
+            t_prev = now
             toks = host_tok[consumed, :b, :q].tolist()
             adv = host_adv[consumed, :b].tolist()
             consumed += 1
@@ -658,7 +671,19 @@ class _FastEngine:
             ready = min(len(x) for x in queues)
             if ready < target and launched - consumed < LOOKAHEAD and launched < MAX_STEPS:
                 launch()
-            while out_i < ready:
+            cap = int(SPEC_PACE * consumed + 1e-9)
+            while out_i < min(ready, cap, target):
+                yield [queues[r][out_i] for r in range(b)]
+                out_i += 1
+        # everything is verified; release what is left on the same schedule
+        if out_i < target:
+            st = sorted(step_times)[len(step_times) // 2] if step_times else 0.004
+            gap = st / SPEC_PACE
+            t_next = time.perf_counter()
+            while out_i < target:
+                t_next += gap
+                while time.perf_counter() < t_next:
+                    pass
                 yield [queues[r][out_i] for r in range(b)]
                 out_i += 1
         self.last_stats = (consumed, max_new_tokens - 1)

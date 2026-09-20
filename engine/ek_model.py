@@ -325,8 +325,8 @@ class Qwen3(torch.nn.Module):
         sin = self.sin.index_select(0, positions)
         # split-K for the two narrow projections: their partial sums are folded
         # into the add+norm that consumes them, so it needs the Triton GEMV path
-        # measured on an H100: -2..4% per step at 4-16 rows, neutral at 1, +1% at 32
-        parts = self.split_k and ws is not None and b <= 16 and self.use_gemv_for(b)
+        parts = (self.split_k and ws is not None and self.use_gemv_for(b)
+                 and b <= int(os.environ.get("ENGINE_SPLIT_MAXB", "32")))
 
         # slot_t = index this token occupies; len_t = valid length including it.
         # Both are advanced once per step so all 36 layers agree on the slot.
@@ -388,26 +388,41 @@ class Qwen3(torch.nn.Module):
         cos = self.cos.index_select(0, positions)
         sin = self.sin.index_select(0, positions)
 
+        rows = b * nq
+        tri = ws[0] != "torch" and self.use_gemv_for(rows)      # tuned Triton projections (<= 32 rows)
+        parts = tri and self.split_k
         residual = F.embedding(tokens.reshape(-1), self.embed)
+        x = None
         for i, layer in enumerate(self.layers):
             if i == 0:
                 x = rms_norm(residual, layer["ln1"], c.rms_eps)
+            elif parts:
+                x, residual = add_rms_norm_parts(x, residual, layer["ln1"], c.rms_eps)
             else:
                 x, residual = add_rms_norm(x, residual, layer["ln1"], c.rms_eps)
-            qkv = torch.matmul(x, layer["qkv_t"])
+            qkv = self._proj(x, layer, "qkv")
             qk_norm_rope_kv(qkv, layer["qn"], layer["kn"], cos, sin,
                             k_cache[i], v_cache[i], len_b,
                             c.num_heads, c.num_kv_heads, c.rms_eps, nq)
-            q = qkv[:, : c.q_size].view(b * nq, c.num_heads, c.head_dim)
+            q = qkv[:, : c.q_size].view(rows, c.num_heads, c.head_dim)
             if ws[0] == "torch":
                 o = attn_torch(q, k_cache[i], v_cache[i], len_b, start_t, self.sm_scale, nq, ws[1])
             else:
                 o = flash_verify(q, k_cache[i], v_cache[i], len_b, start_t, ws, self.sm_scale, nq)
-            x = torch.matmul(o.view(b * nq, c.q_size), layer["o_t"])
-            x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)
-            x = torch.matmul(silu_mul(torch.matmul(x, layer["gu_t"])), layer["down_t"])
-        residual = residual + x
-        hidden = rms_norm(residual, self.final_norm, c.rms_eps)
+            o = o.view(rows, c.q_size)
+            if parts:
+                x, residual = add_rms_norm_parts(gemv_parts(o, layer["o"]), residual,
+                                                 layer["ln2"], c.rms_eps)
+                x = gemv_parts(silu_mul(self._proj(x, layer, "gu")), layer["down"])
+            else:
+                x = self._proj(o, layer, "o")
+                x, residual = add_rms_norm(x, residual, layer["ln2"], c.rms_eps)
+                x = self._mlp(x, layer, small=True)
+        if parts:
+            hidden = add_rms_norm_parts(x, residual, self.final_norm, c.rms_eps)[0]
+        else:
+            residual = residual + x
+            hidden = rms_norm(residual, self.final_norm, c.rms_eps)
         return torch.argmax(torch.matmul(hidden, self.lm_head_t), dim=-1).view(b, nq)
 
     def _decode_attn_ref(self, q, kc, vc, len_t, start_t):
