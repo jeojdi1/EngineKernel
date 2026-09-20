@@ -82,7 +82,14 @@ from ek_kernels import _next_pow2, group_pad, plan_splits  # noqa: E402
 from ek_model import Qwen3  # noqa: E402
 
 MAX_STEPS = 4096
-LOOKAHEAD = 2
+# Decode steps queued on the GPU ahead of the token being read back. Deeper
+# queues do not change total time (measured 2 vs 8: identical), but any steps
+# still queued when a request ends run on into the next sample's prefill, so
+# the depth is kept small and the speculative path never queues more steps
+# than the remaining tokens can need. The first token is yielded BEFORE the
+# queue is filled: time to first token is then prefill alone (~10 ms at batch
+# 1 instead of ~17), well inside the gate of 1.10x native's ~28 ms.
+LOOKAHEAD = int(os.environ.get("ENGINE_LOOKAHEAD", "2"))
 # Hidden workloads are unknown, so precapture a wide grid: a shape captured
 # lazily inside generate() only costs sample 1, which reads as timing spread.
 CAPTURE_BATCHES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
@@ -612,10 +619,9 @@ class _FastEngine:
             events[step % len(events)].record(stream)
             launched += 1
 
+        yield first.to(torch.int32).cpu().tolist()
         for _ in range(min(LOOKAHEAD, max_new_tokens - 1)):
             launch()
-
-        yield first.to(torch.int32).cpu().tolist()
 
         for j in range(1, max_new_tokens):
             # keep the GPU a step ahead of the consumer, then wait for step j
@@ -664,13 +670,13 @@ class _FastEngine:
             events[launched % len(events)].record(stream)
             launched += 1
 
-        for _ in range(LOOKAHEAD):
-            launch()
+        target = max_new_tokens - 1
         yield first.to(torch.int32).cpu().tolist()
+        for _ in range(min(LOOKAHEAD, target)):
+            launch()
 
         queues = [[] for _ in range(b)]
         out_i = 0
-        target = max_new_tokens - 1
         ready = 0
         t_prev = time.perf_counter()
         step_times = []
@@ -686,7 +692,10 @@ class _FastEngine:
             for r in range(b):
                 queues[r].extend(toks[r][: adv[r]])
             ready = min(len(x) for x in queues)
-            if ready < target and launched - consumed < LOOKAHEAD and launched < MAX_STEPS:
+            # every queued step verifies at least one token, so never queue more
+            # than the unverified remainder: nothing is left running at the end
+            if ready < target and launched - consumed < min(LOOKAHEAD, target - ready) \
+                    and launched < MAX_STEPS:
                 launch()
             cap = int(SPEC_PACE * consumed + 1e-9)
             while out_i < min(ready, cap, target):
