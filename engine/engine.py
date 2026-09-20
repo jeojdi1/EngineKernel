@@ -146,8 +146,16 @@ def _spec_q(b: int) -> int:
     return 3
 
 
+# Platform result with speculation at every batch that fit (commit 4319064):
+# batch 1 went 237-247 -> 263 tok/s, but batch 4 went 488 -> 463 -- on the
+# judge's corpus the slowest of four rows accepts too few drafts to pay for the
+# costlier verify step (local docs/code text is more repetitive and flattered
+# it). So speculate only where no slowest row gates progress.
+SPEC_MAX_BATCH = int(os.environ.get("ENGINE_SPEC_MAX_BATCH", "1"))
+
+
 def _spec_ok(b: int) -> bool:
-    return b * _spec_q(b) <= SPEC_MAX_ROWS
+    return b <= SPEC_MAX_BATCH and b * _spec_q(b) <= SPEC_MAX_ROWS
 
 
 class _Graph:
