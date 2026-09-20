@@ -74,9 +74,10 @@ class Qwen3(torch.nn.Module):
         self._gemv_choice = {}
         self.split_k = os.environ.get("ENGINE_SPLIT", "1") == "1"
         self.fuse_swiglu = os.environ.get("ENGINE_SWIGLU", "0") == "1"
-        # one launch per layer fewer on the verify step; +1% at batch 1 once the
-        # attention geometry moved to 64-key tiles (it was inside the noise before)
-        self.fuse_rope_verify = (os.environ.get("ENGINE_ROPE_VERIFY", "1") == "1"
+        # Off: +1% at batch 1 locally, but the platform judged a run with it on
+        # incorrect_output (a store->load race inside the program, since fenced;
+        # not re-validated on the platform, where a failed run costs a slot).
+        self.fuse_rope_verify = (os.environ.get("ENGINE_ROPE_VERIFY", "0") == "1"
                                  and ek_kernels.has_triton())
         self.fuse_rope_attn = (os.environ.get("ENGINE_ROPE_ATTN", "1") == "1"
                                and ek_kernels.has_triton())
