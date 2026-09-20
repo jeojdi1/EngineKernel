@@ -134,6 +134,9 @@ PREFILL_TOKENS = int(os.environ.get("ENGINE_PREFILL_TOKENS", "16384"))
 # Off: measured on an H100 it gains <1% at batch 1 (the first-token readback
 # already waits on queued decode steps, not on launch overhead) and is not yet
 # stable at batch 4.
+# Off: the captured prefill shares the graph pool with the decode graphs and
+# batch-1 tokens diverged on 2 of 6 WikiText prompts with it on (the platform
+# judged two such runs incorrect_output); it was timing-neutral here anyway.
 PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "0") == "1"
 
 
