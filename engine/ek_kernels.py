@@ -1244,7 +1244,6 @@ def plan_splits(batch: int, n_kv: int, bucket: int, block_n: int = 0, target_cta
     batch the launches dominate the tiny amount of KV actually read.
     """
     sms = _sm_count()
-    block_n = block_n or int(os.environ.get("ENGINE_ATTN_BLOCK", "0")) or 128
     target_cta = target_cta or int(os.environ.get("ENGINE_ATTN_CTA", "0")) or 2 * sms
     base = batch * n_kv
     if base >= sms * float(os.environ.get("ENGINE_ATTN_FILL", "0.8")):
@@ -1253,9 +1252,23 @@ def plan_splits(batch: int, n_kv: int, bucket: int, block_n: int = 0, target_cta
         splits = 1
     else:
         splits = max(1, min(32, _cdiv(target_cta, base)))
+    if not block_n:
+        block_n = int(os.environ.get("ENGINE_ATTN_BLOCK", "0"))
+    if not block_n:
+        # 64-key tiles with 4 warps (see attn_warps) ran 20-40% faster than
+        # 128/8 for batch <= 8 at every context swept (b=4 x 2048: 23.4 -> 14.5
+        # us per layer; verify at b=1 x 2048: 12.3 -> 8.8) and 11% faster at
+        # batch 32; only a single wave of unsplit programs (batch 16) prefers
+        # the wider tile.
+        block_n = 128 if (splits == 1 and base <= sms) else 64
     splits = max(1, min(splits, _cdiv(bucket, block_n)))
     chunk = _cdiv(_cdiv(bucket, splits), block_n) * block_n
     return splits, chunk, block_n
+
+
+def attn_warps() -> int:
+    """Warps per attention program; see plan_splits."""
+    return int(os.environ.get("ENGINE_ATTN_WARPS", "0")) or 4
 
 
 def flash_decode(q, k_cache, v_cache, seq_len_t, start_t, workspace, sm_scale):
@@ -1273,7 +1286,7 @@ def flash_decode(q, k_cache, v_cache, seq_len_t, start_t, workspace, sm_scale):
         lsum.stride(0), lsum.stride(1), lsum.stride(2),
         N_KV=hkv, G=g, GP=group_pad(hq, hkv), D=d, BLOCK_N=block_n, CHUNK=chunk,
         SPLITS_ONE=(splits == 1),
-        num_warps=int(os.environ.get("ENGINE_ATTN_WARPS", "8")),
+        num_warps=attn_warps(),
         num_stages=int(os.environ.get("ENGINE_ATTN_STAGES", "3")),
     )
     if splits == 1:
@@ -1305,7 +1318,7 @@ def flash_verify(q, k_cache, v_cache, len_b, start_t, workspace, sm_scale, nq):
         lsum.stride(0), lsum.stride(1), lsum.stride(2),
         N_KV=hkv, G=g, NQ=nq, GP=gp, D=d, BLOCK_N=block_n, CHUNK=chunk,
         SPLITS_ONE=(splits == 1),
-        num_warps=int(os.environ.get("ENGINE_ATTN_WARPS", "8")),
+        num_warps=attn_warps(),
         num_stages=int(os.environ.get("ENGINE_ATTN_STAGES", "3")),
     )
     if splits == 1:
@@ -1364,7 +1377,7 @@ def rope_attn_decode(qkv, qn, kn, cos, sin, k_cache, v_cache, seq_len_t, start_t
         lsum.stride(0), lsum.stride(1), lsum.stride(2),
         N_Q=n_q, N_KV=hkv, G=g, GP=group_pad(n_q, hkv), D=d, HALF=d // 2, EPS=eps,
         BLOCK_N=block_n, CHUNK=chunk, SPLITS_ONE=(splits == 1),
-        num_warps=int(os.environ.get("ENGINE_ATTN_WARPS", "8")),
+        num_warps=attn_warps(),
         num_stages=int(os.environ.get("ENGINE_ATTN_STAGES", "3")),
     )
     if splits == 1:
@@ -1416,7 +1429,7 @@ def rope_attn_verify(qkv, qn, kn, cos, sin, k_cache, v_cache, len_b, start_t, wo
         lsum.stride(0), lsum.stride(1), lsum.stride(2),
         N_Q=n_q, N_KV=hkv, G=g, NQ=nq, GP=acc.shape[3], D=d, HALF=d // 2, EPS=eps,
         BLOCK_N=block_n, CHUNK=chunk, SPLITS_ONE=(splits == 1),
-        num_warps=int(os.environ.get("ENGINE_ATTN_WARPS", "8")),
+        num_warps=attn_warps(),
         num_stages=int(os.environ.get("ENGINE_ATTN_STAGES", "3")),
     )
     if splits == 1:
