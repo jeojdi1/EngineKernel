@@ -76,8 +76,12 @@ def shape(b, nq, bucket, n_kv, n_heads, d) -> int:
         out = K.flash_decode(torch.randn(b, n_heads, d, device=dev, dtype=dt), kc, vc,
                              torch.tensor([max(1, bucket // 2)], dtype=torch.int64, device=dev),
                              torch.zeros(b, dtype=torch.int32, device=dev), ws, d ** -0.5)
+        # the fused norm+rope+cache-write+attention kernel the plain decode path uses
+        out2 = K.rope_attn_decode(qkv[:b].contiguous(), hn, hn, cs[:b].contiguous(), cs[:b].contiguous(),
+                                  kc, vc, torch.tensor([max(2, bucket // 2)], dtype=torch.int64, device=dev),
+                                  torch.zeros(b, dtype=torch.int32, device=dev), ws, d ** -0.5, n_heads, 1e-6)
         torch.cuda.synchronize()
-        return 0 if torch.isfinite(out.float()).all() else 4
+        return 0 if torch.isfinite(out.float()).all() and torch.isfinite(out2.float()).all() else 4
     gp = max(16, K._next_pow2(nq * (n_heads // n_kv)))
     ws = (torch.zeros(b, n_kv, sp, gp, d, dtype=torch.float32, device=dev),
           torch.zeros(b, n_kv, sp, gp, dtype=torch.float32, device=dev),

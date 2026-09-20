@@ -537,6 +537,107 @@ if _HAS_TRITON:
             tl.store(mptr + offs_g, m_i, mask=gmask)
 
     @triton.jit
+    def _rope_attn_decode_kernel(
+        QKV, QN, KN, COS, SIN, K, V, SeqLen, Start,
+        Acc, Lsum, Mmax, Out,
+        sm_scale,
+        stride_qkv_b, stride_cos_b,
+        stride_ob, stride_oh,
+        stride_kb, stride_kh, stride_ks,
+        stride_ab, stride_ah, stride_as, stride_ag,
+        stride_lb, stride_lh, stride_ls,
+        N_Q: tl.constexpr, N_KV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr,
+        D: tl.constexpr, HALF: tl.constexpr, EPS: tl.constexpr,
+        BLOCK_N: tl.constexpr, CHUNK, SPLITS_ONE: tl.constexpr,
+    ):
+        """Decode attention that does its own QK-norm, rotary and cache write.
+
+        One program per (sequence, kv-head, split), as in _flash_decode_split_kernel,
+        but it starts from the raw fused QKV row: it norms and rotates its group
+        of G query heads and the new key, and the split that owns the new slot
+        stores the key/value before attending. That retires the separate
+        norm+rope+cache kernel -- a launch per layer whose work is a few hundred
+        elements. Arithmetic and rounding points are identical to
+        _qk_norm_rope_kv_kernel.
+        """
+        pid_bh = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        b = pid_bh // N_KV
+        h = pid_bh % N_KV
+
+        seq_len = tl.load(SeqLen)          # valid length including the new token
+        start = tl.load(Start + b)
+        slot = seq_len - 1
+        lo = pid_s * CHUNK
+        hi = tl.minimum(lo + CHUNK, seq_len)
+        owns_new = (slot >= lo) & (slot < hi)
+        lo = tl.maximum(lo, start)
+
+        cols = tl.arange(0, D)
+        idx = tl.where(cols < HALF, cols + HALF, cols - HALF)
+        cos = tl.load(COS + b * stride_cos_b + cols)
+        sin = tl.load(SIN + b * stride_cos_b + cols)
+        row = QKV + b * stride_qkv_b
+
+        # ---- the G query heads of this kv-head: norm + rope, padded to GP rows ----
+        offs_g = tl.arange(0, GP)
+        gmask = offs_g < G
+        qbase = row + ((h * G + offs_g) * D)[:, None]
+        xq = tl.load(qbase + cols[None, :], mask=gmask[:, None], other=0.0).to(tl.float32)
+        xqp = tl.load(qbase + idx[None, :], mask=gmask[:, None], other=0.0).to(tl.float32)
+        rq = tl.rsqrt(tl.sum(xq * xq, axis=1) / D + EPS)
+        wq = tl.load(QN + cols)
+        wqp = tl.load(QN + idx)
+        qn_ = (xq * rq[:, None]).to(tl.bfloat16) * wq[None, :]
+        qpn = (xqp * rq[:, None]).to(tl.bfloat16) * wqp[None, :]
+        qrot = tl.where(cols[None, :] < HALF, -qpn, qpn)
+        q = (qn_ * cos[None, :]) + (qrot * sin[None, :])
+        q = tl.where(gmask[:, None], q, 0.0).to(tl.bfloat16)   # the 0.0 literal would promote q to fp32
+
+        kbase = K + b * stride_kb + h * stride_kh
+        vbase = V + b * stride_kb + h * stride_kh
+        if owns_new:
+            krow = row + (N_Q + h) * D
+            xk = tl.load(krow + cols).to(tl.float32)
+            xkp = tl.load(krow + idx).to(tl.float32)
+            rk = tl.rsqrt(tl.sum(xk * xk, axis=0) / D + EPS)
+            kn_ = (xk * rk).to(tl.bfloat16) * tl.load(KN + cols)
+            kpn = (xkp * rk).to(tl.bfloat16) * tl.load(KN + idx)
+            krot = tl.where(cols < HALF, -kpn, kpn)
+            tl.store(kbase + slot * stride_ks + cols, (kn_ * cos) + (krot * sin))
+            tl.store(vbase + slot * stride_ks + cols, tl.load(row + (N_Q + N_KV + h) * D + cols))
+
+        m_i = tl.full([GP], -1e30, tl.float32)
+        l_i = tl.zeros([GP], tl.float32)
+        acc = tl.zeros([GP, D], tl.float32)
+        for n0 in range(lo, hi, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            nmask = offs_n < hi
+            k = tl.load(kbase + offs_n[:, None] * stride_ks + cols[None, :],
+                        mask=nmask[:, None], other=0.0)
+            qk = tl.dot(q, tl.trans(k)) * sm_scale
+            qk = tl.where(nmask[None, :], qk, -1e30)
+            m_new = tl.maximum(m_i, tl.max(qk, 1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(qk - m_new[:, None])
+            v = tl.load(vbase + offs_n[:, None] * stride_ks + cols[None, :],
+                        mask=nmask[:, None], other=0.0)
+            acc = acc * alpha[:, None] + tl.dot(p, v.to(tl.float32))
+            l_i = l_i * alpha + tl.sum(p, 1)
+            m_i = m_new
+
+        if SPLITS_ONE:
+            tl.store(Out + b * stride_ob + (h * G + offs_g)[:, None] * stride_oh + cols[None, :],
+                     (acc / l_i[:, None]).to(tl.bfloat16), mask=gmask[:, None])
+        else:
+            aptr = Acc + b * stride_ab + h * stride_ah + pid_s * stride_as
+            tl.store(aptr + offs_g[:, None] * stride_ag + cols[None, :], acc, mask=gmask[:, None])
+            lptr = Lsum + b * stride_lb + h * stride_lh + pid_s * stride_ls
+            mptr = Mmax + b * stride_lb + h * stride_lh + pid_s * stride_ls
+            tl.store(lptr + offs_g, l_i, mask=gmask)
+            tl.store(mptr + offs_g, m_i, mask=gmask)
+
+    @triton.jit
     def _flash_verify_split_kernel(
         Q, K, V, LenB, Start,
         Acc, Lsum, Mmax, Out,
@@ -1073,3 +1174,37 @@ def attn_torch(q, k_cache, v_cache, len_b, start_t, sm_scale, nq, bucket):
     p = torch.softmax(scores, dim=-1).to(q.dtype)
     out = torch.matmul(p, v)
     return out.view(b, hkv, nq, g, d).permute(0, 2, 1, 3, 4).reshape(bq, hq, d)
+
+
+def rope_attn_decode(qkv, qn, kn, cos, sin, k_cache, v_cache, seq_len_t, start_t, workspace,
+                     sm_scale, n_q, eps):
+    """QK-norm + rotary + cache write + decode attention, from the raw fused QKV
+    rows [B, (n_q + 2*n_kv)*D]. seq_len_t already counts the new token."""
+    b = qkv.shape[0]
+    hkv = k_cache.shape[1]
+    d = qn.shape[0]
+    g = n_q // hkv
+    acc, lsum, mmax, out, splits, chunk, block_n = workspace
+    _rope_attn_decode_kernel[(b * hkv, splits)](
+        qkv, qn, kn, cos, sin, k_cache, v_cache, seq_len_t, start_t,
+        acc, lsum, mmax, out, sm_scale,
+        qkv.stride(0), cos.stride(0),
+        out.stride(0), out.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
+        lsum.stride(0), lsum.stride(1), lsum.stride(2),
+        N_Q=n_q, N_KV=hkv, G=g, GP=group_pad(n_q, hkv), D=d, HALF=d // 2, EPS=eps,
+        BLOCK_N=block_n, CHUNK=chunk, SPLITS_ONE=(splits == 1),
+        num_warps=int(os.environ.get("ENGINE_ATTN_WARPS", "8")),
+        num_stages=int(os.environ.get("ENGINE_ATTN_STAGES", "3")),
+    )
+    if splits == 1:
+        return out
+    _flash_decode_combine_kernel[(b * hkv * g,)](
+        acc, lsum, mmax, out,
+        acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
+        lsum.stride(0), lsum.stride(1), lsum.stride(2),
+        out.stride(0), out.stride(1),
+        N_KV=hkv, G=g, D=d, SPLITS=_next_pow2(splits), num_warps=4,
+    )
+    return out

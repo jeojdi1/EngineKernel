@@ -18,7 +18,8 @@ import torch
 import torch.nn.functional as F
 
 import ek_kernels
-from ek_kernels import (add_rms_norm, add_rms_norm_parts, attn_torch, gemv_parts, gemv_swiglu, flash_decode, flash_verify, gemv,
+from ek_kernels import (add_rms_norm, add_rms_norm_parts, attn_torch, gemv_parts, gemv_swiglu,
+                        rope_attn_decode, flash_decode, flash_verify, gemv,
                         norm_gemv, qk_norm_rope_kv, rms_norm, silu_mul)
 
 
@@ -73,6 +74,8 @@ class Qwen3(torch.nn.Module):
         self._gemv_choice = {}
         self.split_k = os.environ.get("ENGINE_SPLIT", "1") == "1"
         self.fuse_swiglu = os.environ.get("ENGINE_SWIGLU", "0") == "1"
+        self.fuse_rope_attn = (os.environ.get("ENGINE_ROPE_ATTN", "1") == "1"
+                               and ek_kernels.has_triton())
         self.fused = os.environ.get("ENGINE_FUSED", "0") == "1" and ek_kernels.has_triton()
         self.use_gemv = (os.environ.get("ENGINE_GEMV") == "1" if "ENGINE_GEMV" in os.environ
                          else self._pick_projection_path())
@@ -341,15 +344,19 @@ class Qwen3(torch.nn.Module):
                 x, residual = add_rms_norm(x, residual, layer["ln1"], c.rms_eps)
 
             qkv = self._proj(x, layer, "qkv")
-            qk_norm_rope_kv(qkv, layer["qn"], layer["kn"], cos, sin,
-                            k_cache[i], v_cache[i], slot_t,
-                            c.num_heads, c.num_kv_heads, c.rms_eps, 1)
-
-            q = qkv[:, : c.q_size].view(b, c.num_heads, c.head_dim)
-            if ws is None:
-                o = self._decode_attn_ref(q, k_cache[i], v_cache[i], len_t, start_t)
+            if self.fuse_rope_attn and ws is not None:
+                o = rope_attn_decode(qkv, layer["qn"], layer["kn"], cos, sin,
+                                     k_cache[i], v_cache[i], len_t, start_t, ws,
+                                     self.sm_scale, c.num_heads, c.rms_eps)
             else:
-                o = flash_decode(q, k_cache[i], v_cache[i], len_t, start_t, ws, self.sm_scale)
+                qk_norm_rope_kv(qkv, layer["qn"], layer["kn"], cos, sin,
+                                k_cache[i], v_cache[i], slot_t,
+                                c.num_heads, c.num_kv_heads, c.rms_eps, 1)
+                q = qkv[:, : c.q_size].view(b, c.num_heads, c.head_dim)
+                if ws is None:
+                    o = self._decode_attn_ref(q, k_cache[i], v_cache[i], len_t, start_t)
+                else:
+                    o = flash_decode(q, k_cache[i], v_cache[i], len_t, start_t, ws, self.sm_scale)
             o = o.view(b, c.q_size)
             if parts:
                 x, residual = add_rms_norm_parts(gemv_parts(o, layer["o"]), residual,

@@ -89,6 +89,12 @@ def main():
             failures += 1
         else:
             print(f"ok   {name}: {n} steps x {len(prompts)} seqs match")
+    # The engine degrades silently by design, so a broken fast path would still
+    # "pass" here on the reference loop. Make that a test failure.
+    tier = getattr(eng, "tier", "fast")
+    if tier != "fast":
+        print(f"FAIL engine fell back to the {tier!r} tier: the fast path raised")
+        failures += 1
     print("FAILURES:", failures)
     return 1 if failures else 0
 
